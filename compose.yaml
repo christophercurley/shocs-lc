@@ -1,0 +1,15 @@
+services:
+  shocs-lc:
+    build:
+      context: .
+    container_name: shocs-lc
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # Set this to SHOCS0's address on the LAN.
+      SHOCS_LC_BIND: "192.168.1.252:0"
+
+      # Current LIFX subnet-directed broadcast address.
+      SHOCS_LC_LIFX_BROADCAST: "192.168.1.255:56700"
+
+      SHOCS_LC_DISCOVERY_INTERVAL_SECS: "30"
