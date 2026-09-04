@@ -467,3 +467,54 @@ h1 {
     transform: translateX(24px);
   }
 }
+
+
+/* Mobile touch tuning: keep the desktop slider untouched, but give fingers
+   a substantially larger target on phones. */
+@media (max-width: 760px) {
+  .brightness-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 44px;
+    background: transparent;
+  }
+
+  .brightness-slider::-webkit-slider-runnable-track {
+    height: 6px;
+    border-radius: 999px;
+    background: #dfe4ea;
+  }
+
+  .brightness-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 30px;
+    height: 30px;
+    margin-top: -12px;
+    border: 3px solid #fff;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 2px 8px rgba(32, 44, 64, 0.24);
+  }
+
+  .brightness-slider::-moz-range-track {
+    height: 6px;
+    border: 0;
+    border-radius: 999px;
+    background: #dfe4ea;
+  }
+
+  .brightness-slider::-moz-range-progress {
+    height: 6px;
+    border-radius: 999px;
+    background: var(--accent);
+  }
+
+  .brightness-slider::-moz-range-thumb {
+    width: 30px;
+    height: 30px;
+    border: 3px solid #fff;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 2px 8px rgba(32, 44, 64, 0.24);
+  }
+}

@@ -11,6 +11,11 @@ use crate::registry::{ControllerState, LightMode, refresh_registry};
 use crate::schedule::{desired_power_now, next_power_boundary};
 use crate::test_mode::TestModeState;
 
+const TEST_SYNC_SETTLE_MARGIN: Duration = Duration::from_millis(400);
+const TEST_SYNC_MAX_ATTEMPTS: usize = 2;
+const TEST_SYNC_COLOR_TOLERANCE: u16 = 512;
+const TEST_SYNC_KELVIN_TOLERANCE: u16 = 50;
+
 pub async fn apply_test_power(
     client: &LifxClient,
     state: &ControllerState,
@@ -44,8 +49,8 @@ pub async fn apply_test_power(
 
 /// Apply Test Mode's complete current desired state to one light.
 ///
-/// This is used when a light joins Test Mode so it immediately matches the
-/// existing group instead of waiting for the next color or power event.
+/// Color and brightness are carried in the same LIFX HSBK command, so both
+/// travel toward the mode target over the configured transition time.
 pub async fn sync_light_to_test_mode(
     client: &LifxClient,
     device: &LifxDevice,
@@ -59,6 +64,110 @@ pub async fn sync_light_to_test_mode(
     client.set_power(device, power, config.transition).await?;
 
     Ok(())
+}
+
+/// Confirm that a newly enrolled light actually arrived at Test Mode's current
+/// state after the transition. If it did not, retry the complete state once.
+///
+/// The mode is checked before each verification/retry so a user who moves the
+/// light back to Custom while this is running is never fought by stale work.
+pub async fn confirm_test_mode_sync(
+    client: Arc<LifxClient>,
+    state: ControllerState,
+    config: Arc<Config>,
+    test_mode: TestModeState,
+    device: LifxDevice,
+) {
+    let settle_time = config.transition.saturating_add(TEST_SYNC_SETTLE_MARGIN);
+
+    sleep(settle_time).await;
+
+    for attempt in 1..=TEST_SYNC_MAX_ATTEMPTS {
+        let still_in_test = state
+            .light(device.id)
+            .await
+            .is_some_and(|light| light.mode == LightMode::Test);
+
+        if !still_in_test {
+            trace!(
+                lifx_id = %format!("{:#018x}", device.id),
+                "Test Mode synchronization cancelled because light left the mode"
+            );
+            return;
+        }
+
+        let (color_name, desired_color) = test_mode.current_color();
+        let desired_power = test_mode.power();
+
+        match client.get_light_state(&device).await {
+            Ok(observed) => {
+                state.record_observation(device.id, observed).await;
+
+                if test_state_matches(observed, desired_color, desired_power) {
+                    info!(
+                        lifx_id = %format!("{:#018x}", device.id),
+                        color = color_name,
+                        brightness = desired_color.brightness,
+                        power = ?desired_power,
+                        attempt,
+                        "confirmed light synchronized to Test Mode"
+                    );
+                    return;
+                }
+
+                warn!(
+                    lifx_id = %format!("{:#018x}", device.id),
+                    color = color_name,
+                    desired_brightness = desired_color.brightness,
+                    observed_brightness = observed.brightness,
+                    desired_power = ?desired_power,
+                    observed_power = ?observed.power,
+                    attempt,
+                    "light did not fully reach Test Mode target"
+                );
+            }
+            Err(err) => warn!(
+                lifx_id = %format!("{:#018x}", device.id),
+                attempt,
+                error = %err,
+                "could not verify Test Mode synchronization"
+            ),
+        }
+
+        if attempt == TEST_SYNC_MAX_ATTEMPTS {
+            break;
+        }
+
+        // Re-checking current Test state inside sync_light_to_test_mode means a
+        // color heartbeat that happened during the first transition is handled
+        // naturally: the retry targets whatever Test Mode owns *now*.
+        if let Err(err) = sync_light_to_test_mode(&client, &device, &config, &test_mode).await {
+            warn!(
+                lifx_id = %format!("{:#018x}", device.id),
+                error = %err,
+                "failed to retry Test Mode synchronization"
+            );
+            return;
+        }
+
+        sleep(settle_time).await;
+    }
+
+    warn!(
+        lifx_id = %format!("{:#018x}", device.id),
+        "Test Mode synchronization could not be confirmed after retry"
+    );
+}
+
+fn test_state_matches(observed: lifx::LightState, desired: lifx::Color, power: Power) -> bool {
+    let hue_matches = desired.saturation <= TEST_SYNC_COLOR_TOLERANCE
+        || observed.hue.abs_diff(desired.hue) <= TEST_SYNC_COLOR_TOLERANCE;
+
+    observed.power == power
+        && hue_matches
+        && observed.saturation.abs_diff(desired.saturation) <= TEST_SYNC_COLOR_TOLERANCE
+        && observed.brightness.abs_diff(desired.brightness) <= TEST_SYNC_COLOR_TOLERANCE
+        && observed.kelvin.abs_diff(desired.kelvin) <= TEST_SYNC_KELVIN_TOLERANCE
 }
 
 pub async fn poll_light_states(client: &LifxClient, state: &ControllerState) -> usize {
@@ -101,11 +210,7 @@ pub async fn poll_light_states(client: &LifxClient, state: &ControllerState) -> 
     updated
 }
 
-pub async fn discovery_task(
-    client: Arc<LifxClient>,
-    state: ControllerState,
-    config: Arc<Config>,
-) {
+pub async fn discovery_task(client: Arc<LifxClient>, state: ControllerState, config: Arc<Config>) {
     loop {
         sleep(config.discovery_interval).await;
 
@@ -116,11 +221,7 @@ pub async fn discovery_task(
     }
 }
 
-pub async fn state_poll_task(
-    client: Arc<LifxClient>,
-    state: ControllerState,
-    config: Arc<Config>,
-) {
+pub async fn state_poll_task(client: Arc<LifxClient>, state: ControllerState, config: Arc<Config>) {
     loop {
         sleep(config.state_poll_interval).await;
         let updated = poll_light_states(&client, &state).await;
@@ -179,7 +280,10 @@ pub async fn color_task(
         let (name, color) = test_mode.current_color();
 
         if devices.is_empty() {
-            debug!(color = name, "Test Mode color heartbeat skipped: no enrolled lights");
+            debug!(
+                color = name,
+                "Test Mode color heartbeat skipped: no enrolled lights"
+            );
         } else {
             match client
                 .set_color_many(&devices, color, config.transition)

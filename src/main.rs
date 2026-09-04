@@ -55,9 +55,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     info!(ids = %initial_test_ids, "lights configured to start in Test Mode");
 
-    let client = Arc::new(
-        LifxClient::bind(config.bind_addr, config.lifx_broadcast_addr, SOURCE_ID).await?,
-    );
+    let client =
+        Arc::new(LifxClient::bind(config.bind_addr, config.lifx_broadcast_addr, SOURCE_ID).await?);
 
     let state = ControllerState::new(&config.initial_test_ids);
 

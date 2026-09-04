@@ -13,7 +13,7 @@ use tracing::{info, trace};
 
 use crate::config::Config;
 use crate::registry::{ControllerState, LightMode, ManagedLight};
-use crate::tasks::sync_light_to_test_mode;
+use crate::tasks::{confirm_test_mode_sync, sync_light_to_test_mode};
 use crate::test_mode::TestModeState;
 
 const MANUAL_TRANSITION: Duration = Duration::from_millis(250);
@@ -260,8 +260,21 @@ async fn set_mode(
             color = color_name,
             brightness = color.brightness,
             power = ?power,
-            "synchronized light to current Test Mode state"
+            transition_seconds = state.config.transition.as_secs(),
+            "started synchronization to current Test Mode state"
         );
+
+        // The regular 10-second observation poll can catch a light halfway
+        // through a 5-second fade. Do a dedicated post-transition readback so
+        // the controller/UI receives the real final value instead of caching
+        // an intermediate brightness such as 80% or 89%.
+        tokio::spawn(confirm_test_mode_sync(
+            Arc::clone(&state.client),
+            state.controller.clone(),
+            Arc::clone(&state.config),
+            state.test_mode.clone(),
+            light.device.clone(),
+        ));
     }
 
     info!(
@@ -290,11 +303,7 @@ async fn confirm_observation(state: &WebState, id: LifxId, light: &ManagedLight)
 }
 
 fn sort_name(light: &ManagedLight) -> String {
-    light
-        .label
-        .as_deref()
-        .unwrap_or("")
-        .to_ascii_lowercase()
+    light.label.as_deref().unwrap_or("").to_ascii_lowercase()
 }
 
 fn to_light_view(light: ManagedLight, online_window: Duration) -> LightView {
