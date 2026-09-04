@@ -104,23 +104,43 @@ async fn set_power(
         .await
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
 
-    // Manual control is authoritative: leave automation before sending the
-    // physical command so Test Mode cannot immediately fight the user.
-    state.controller.set_mode(id, LightMode::Custom).await;
-
     let power = if request.on { Power::On } else { Power::Off };
-    state
+
+    // Power is intentionally orthogonal to mode. While a light is in Test
+    // Mode, a manual power command becomes a temporary per-light override
+    // instead of ejecting the light from the mode. The next Test power
+    // schedule boundary clears the override and resumes scheduled power.
+    let previous_override = if light.mode == LightMode::Test {
+        state
+            .controller
+            .set_power_override(id, Some(power))
+            .await
+            .flatten()
+    } else {
+        light.power_override
+    };
+
+    if let Err(err) = state
         .client
         .set_power(&light.device, power, MANUAL_TRANSITION)
         .await
-        .map_err(ApiError::lifx)?;
+    {
+        if light.mode == LightMode::Test {
+            let _ = state
+                .controller
+                .set_power_override(id, previous_override)
+                .await;
+        }
+        return Err(ApiError::lifx(err));
+    }
 
     confirm_observation(&state, id, &light).await;
 
     info!(
         lifx_id = %format!("{id:#018x}"),
         power = ?power,
-        mode = "custom",
+        mode = light.mode.as_str(),
+        power_override = light.mode == LightMode::Test,
         "manual web power command"
     );
 
@@ -153,6 +173,8 @@ async fn set_brightness(
     let previous_mode = state.controller.set_mode(id, LightMode::Custom).await;
 
     if previous_mode == Some(LightMode::Test) {
+        let _ = state.controller.set_power_override(id, None).await;
+
         info!(
             lifx_id = %format!("{id:#018x}"),
             "manual live control moved light from Test to Custom mode"
@@ -237,6 +259,15 @@ async fn set_mode(
         .await
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
 
+    // Changing modes starts with a clean mode-owned power state. Manual Test
+    // power overrides are intentionally per-enrollment and do not leak across
+    // a mode toggle.
+    let previous_override = state
+        .controller
+        .set_power_override(id, None)
+        .await
+        .flatten();
+
     if mode == LightMode::Test {
         let (color_name, color) = state.test_mode.current_color();
         let power = state.test_mode.power();
@@ -248,10 +279,15 @@ async fn set_mode(
             &light.device,
             &state.config,
             &state.test_mode,
+            power,
         )
         .await
         {
-            state.controller.set_mode(id, previous).await;
+            let _ = state.controller.set_mode(id, previous).await;
+            let _ = state
+                .controller
+                .set_power_override(id, previous_override)
+                .await;
             return Err(ApiError::lifx(err));
         }
 

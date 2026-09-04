@@ -482,7 +482,13 @@ h1 {
   .brightness-slider::-webkit-slider-runnable-track {
     height: 6px;
     border-radius: 999px;
-    background: #dfe4ea;
+    background: linear-gradient(
+      to right,
+      var(--accent) 0%,
+      var(--accent) var(--brightness-fill, 0%),
+      #dfe4ea var(--brightness-fill, 0%),
+      #dfe4ea 100%
+    );
   }
 
   .brightness-slider::-webkit-slider-thumb {

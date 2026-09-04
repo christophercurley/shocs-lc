@@ -56,9 +56,9 @@ pub async fn sync_light_to_test_mode(
     device: &LifxDevice,
     config: &Config,
     test_mode: &TestModeState,
+    power: Power,
 ) -> lifx::Result<()> {
     let (_, color) = test_mode.current_color();
-    let power = test_mode.power();
 
     client.set_color(device, color, config.transition).await?;
     client.set_power(device, power, config.transition).await?;
@@ -83,12 +83,11 @@ pub async fn confirm_test_mode_sync(
     sleep(settle_time).await;
 
     for attempt in 1..=TEST_SYNC_MAX_ATTEMPTS {
-        let still_in_test = state
-            .light(device.id)
-            .await
-            .is_some_and(|light| light.mode == LightMode::Test);
+        let Some(light) = state.light(device.id).await else {
+            return;
+        };
 
-        if !still_in_test {
+        if light.mode != LightMode::Test {
             trace!(
                 lifx_id = %format!("{:#018x}", device.id),
                 "Test Mode synchronization cancelled because light left the mode"
@@ -97,7 +96,7 @@ pub async fn confirm_test_mode_sync(
         }
 
         let (color_name, desired_color) = test_mode.current_color();
-        let desired_power = test_mode.power();
+        let desired_power = light.power_override.unwrap_or(test_mode.power());
 
         match client.get_light_state(&device).await {
             Ok(observed) => {
@@ -141,7 +140,9 @@ pub async fn confirm_test_mode_sync(
         // Re-checking current Test state inside sync_light_to_test_mode means a
         // color heartbeat that happened during the first transition is handled
         // naturally: the retry targets whatever Test Mode owns *now*.
-        if let Err(err) = sync_light_to_test_mode(&client, &device, &config, &test_mode).await {
+        if let Err(err) =
+            sync_light_to_test_mode(&client, &device, &config, &test_mode, desired_power).await
+        {
             warn!(
                 lifx_id = %format!("{:#018x}", device.id),
                 error = %err,
@@ -242,29 +243,41 @@ pub async fn test_reconcile_task(
     loop {
         sleep(interval).await;
 
-        let desired = test_mode.power();
-        let devices = state
-            .devices_with_power_mismatch(LightMode::Test, desired)
+        let mode_power = test_mode.power();
+        let mismatches = state
+            .devices_with_power_mismatch(LightMode::Test, mode_power)
             .await;
 
-        if devices.is_empty() {
+        if mismatches.is_empty() {
             continue;
         }
 
-        match client
-            .set_power_many(&devices, desired, config.transition)
-            .await
-        {
-            Ok(()) => info!(
-                power = ?desired,
-                lights = devices.len(),
-                "reconciled Test Mode power after observed mismatch"
-            ),
-            Err(err) => warn!(
-                power = ?desired,
-                error = %err,
-                "Test Mode power reconciliation failed"
-            ),
+        for desired in [Power::Off, Power::On] {
+            let devices = mismatches
+                .iter()
+                .filter(|(_, power)| *power == desired)
+                .map(|(device, _)| device.clone())
+                .collect::<Vec<_>>();
+
+            if devices.is_empty() {
+                continue;
+            }
+
+            match client
+                .set_power_many(&devices, desired, config.transition)
+                .await
+            {
+                Ok(()) => info!(
+                    power = ?desired,
+                    lights = devices.len(),
+                    "reconciled Test Mode power after observed mismatch"
+                ),
+                Err(err) => warn!(
+                    power = ?desired,
+                    error = %err,
+                    "Test Mode power reconciliation failed"
+                ),
+            }
         }
     }
 }
@@ -339,7 +352,13 @@ pub async fn power_schedule_task(
         sleep(wait).await;
 
         test_mode.set_power(power);
-        info!(power = ?power, "Test Mode power boundary reached");
+        let cleared = state.clear_power_overrides_in_mode(LightMode::Test).await;
+
+        info!(
+            power = ?power,
+            cleared_power_overrides = cleared,
+            "Test Mode power boundary reached"
+        );
         apply_test_power(&client, &state, &config, power).await;
 
         // Re-evaluate civil time after every boundary so DST and wall-clock

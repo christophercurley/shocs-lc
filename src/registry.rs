@@ -28,6 +28,11 @@ pub struct ManagedLight {
     pub label: Option<String>,
     pub mode: LightMode,
     pub observed: Option<LightState>,
+    /// Explicit manual power choice layered over an automation mode.
+    ///
+    /// For Test Mode this survives heartbeats/reconciliation until the next
+    /// Test power-schedule boundary. Other properties still come from the mode.
+    pub power_override: Option<Power>,
     pub last_discovered: Instant,
     pub last_observed: Option<Instant>,
 }
@@ -75,6 +80,33 @@ impl ControllerState {
         Some(previous)
     }
 
+    pub async fn set_power_override(
+        &self,
+        id: LifxId,
+        power: Option<Power>,
+    ) -> Option<Option<Power>> {
+        let mut lights = self.lights.write().await;
+        let light = lights.get_mut(&id)?;
+        let previous = light.power_override;
+        light.power_override = power;
+        Some(previous)
+    }
+
+    /// Clear manual power overrides for every light currently in `mode`.
+    /// Returns the number of overrides removed.
+    pub async fn clear_power_overrides_in_mode(&self, mode: LightMode) -> usize {
+        let mut lights = self.lights.write().await;
+        let mut cleared = 0usize;
+
+        for light in lights.values_mut().filter(|light| light.mode == mode) {
+            if light.power_override.take().is_some() {
+                cleared += 1;
+            }
+        }
+
+        cleared
+    }
+
     pub async fn known_devices(&self) -> Vec<LifxDevice> {
         self.lights
             .read()
@@ -94,20 +126,30 @@ impl ControllerState {
             .collect()
     }
 
+    /// Return mode lights whose observed power differs from their effective
+    /// desired power. A manual power override wins over the mode's default.
     pub async fn devices_with_power_mismatch(
         &self,
         mode: LightMode,
-        desired: Power,
-    ) -> Vec<LifxDevice> {
+        mode_power: Power,
+    ) -> Vec<(LifxDevice, Power)> {
         self.lights
             .read()
             .await
             .values()
-            .filter(|light| {
-                light.mode == mode
-                    && matches!(light.observed, Some(observed) if observed.power != desired)
+            .filter_map(|light| {
+                if light.mode != mode {
+                    return None;
+                }
+
+                let desired = light.power_override.unwrap_or(mode_power);
+                match light.observed {
+                    Some(observed) if observed.power != desired => {
+                        Some((light.device.clone(), desired))
+                    }
+                    _ => None,
+                }
             })
-            .map(|light| light.device.clone())
             .collect()
     }
 
@@ -177,6 +219,7 @@ pub async fn refresh_registry(client: &LifxClient, state: &ControllerState) -> l
                     label,
                     mode,
                     observed: None,
+                    power_override: None,
                     last_discovered: now,
                     last_observed: None,
                 });

@@ -98,6 +98,11 @@ function createLiveControlSender(url, { onError, onCommit }) {
   };
 }
 
+function setBrightnessVisual(slider, percent) {
+  const clamped = Math.max(0, Math.min(100, Number(percent)));
+  slider.style.setProperty("--brightness-fill", `${clamped}%`);
+}
+
 function createSwitch(checked, label, onChange) {
   const wrapper = document.createElement("label");
   wrapper.className = "switch";
@@ -148,7 +153,7 @@ function createCard(light) {
   powerRow.innerHTML = `
     <div class="control-copy">
       <span class="control-label">Power</span>
-      <span class="control-help">Manual change switches this light to Custom.</span>
+      <span class="control-help">Power override keeps the current mode active.</span>
     </div>
   `;
 
@@ -209,8 +214,9 @@ function createCard(light) {
   slider.addEventListener("input", () => {
     const desired = Number(slider.value);
     brightnessValue.textContent = `${desired}%`;
+    setBrightnessVisual(slider, desired);
 
-    // A manual lighting command exits Test Mode immediately. The next API
+    // A manual brightness command exits Test Mode immediately. The next API
     // refresh will confirm the controller state, but update the toggle now so
     // the UI never suggests that automation is still authoritative.
     testSwitch.input.checked = false;
@@ -289,8 +295,10 @@ function updateCard(light) {
   if (hasState && document.activeElement !== refs.slider) {
     refs.slider.value = String(light.brightness_percent);
     refs.brightnessValue.textContent = `${light.brightness_percent}%`;
+    setBrightnessVisual(refs.slider, light.brightness_percent);
   } else if (!hasState) {
     refs.brightnessValue.textContent = "—";
+    setBrightnessVisual(refs.slider, 0);
   }
 
   refs.testInput.checked = light.mode === "test";
