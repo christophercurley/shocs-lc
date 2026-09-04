@@ -12,8 +12,12 @@ services:
       SHOCS_LC_BIND: "192.168.1.252:0"
       SHOCS_LC_LIFX_BROADCAST: "192.168.1.255:56700"
 
-      # These IDs begin in Test Mode on each service start. The web UI will
-      # eventually take over runtime enrollment without requiring config edits.
+      # PH1-A intentionally exposes the debug UI directly on the LAN. PH2 will
+      # move Axum behind Caddy on loopback and add HTTPS/authentication.
+      SHOCS_LC_HTTP_BIND: "192.168.1.252:8080"
+
+      # These IDs begin in Test Mode on each service start. Runtime mode changes
+      # made in the debug UI are intentionally in-memory only for now.
       SHOCS_LC_CONTROLLED_IDS: "0x0000cc5b85d573d0,0x0000c66685d573d0"
 
       # Discovery is independent of automation and continuously refreshes
@@ -32,6 +36,4 @@ services:
       SHOCS_LC_OFF_TIME: "02:00"
       SHOCS_LC_ON_TIME: "10:00"
 
-      # Keep debug enabled while PH0-B is being validated. Stable state polls
-      # stay quiet; meaningful observed-state changes are logged at DEBUG.
       RUST_LOG: "shocs_lc=debug"

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Lights · SHOCS</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand-link" href="/" aria-label="SHOCS home">
+        <span class="brand-mark brand-mark-small" aria-hidden="true">S</span>
+        <span>SHOCS</span>
+      </a>
+      <span class="debug-pill">PH1 DEBUG</span>
+    </div>
+  </header>
+
+  <main class="shell lights-shell">
+    <section class="page-heading">
+      <div>
+        <p class="eyebrow">LIGHT CONTROLLER</p>
+        <h1>Lights</h1>
+        <p>Live controls for every LIFX light currently known to SHOCS.</p>
+      </div>
+      <div class="refresh-status" id="refresh-status" aria-live="polite">Connecting…</div>
+    </section>
+
+    <section class="light-grid" id="light-grid" aria-live="polite">
+      <div class="empty-card" id="loading-card">Loading discovered lights…</div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

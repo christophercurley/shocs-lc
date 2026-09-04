@@ -20,6 +20,7 @@ const DEFAULT_ON_TIME: &str = "10:00";
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub lifx_broadcast_addr: SocketAddr,
+    pub http_bind_addr: SocketAddr,
     pub initial_test_ids: Vec<LifxId>,
     pub discovery_interval: Duration,
     pub state_poll_interval: Duration,
@@ -45,6 +46,7 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr = required_socket_addr("SHOCS_LC_BIND")?;
         let lifx_broadcast_addr = required_socket_addr("SHOCS_LC_LIFX_BROADCAST")?;
+        let http_bind_addr = required_socket_addr("SHOCS_LC_HTTP_BIND")?;
 
         // Keep the existing environment-variable name for compatibility. Its
         // meaning is now "lights that start in Test Mode" rather than a global
@@ -102,6 +104,7 @@ impl Config {
         Ok(Self {
             bind_addr,
             lifx_broadcast_addr,
+            http_bind_addr,
             initial_test_ids,
             discovery_interval,
             state_poll_interval,

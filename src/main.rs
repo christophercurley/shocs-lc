@@ -3,13 +3,15 @@ mod logging;
 mod registry;
 mod schedule;
 mod tasks;
+mod web;
 
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use lifx::{LifxClient, Power};
-use tracing::{info, warn};
+use tokio::net::TcpListener;
+use tracing::{error, info, warn};
 
 use config::Config;
 use registry::{ControllerState, refresh_registry};
@@ -18,6 +20,7 @@ use tasks::{
     apply_test_power, color_task, discovery_task, poll_light_states, power_schedule_task,
     state_poll_task, test_reconcile_task,
 };
+use web::WebState;
 
 const SOURCE_ID: u32 = 0x5348_4F43; // "SHOC"
 
@@ -36,6 +39,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!(
         bind = %config.bind_addr,
         broadcast = %config.lifx_broadcast_addr,
+        http_bind = %config.http_bind_addr,
         discovery_seconds = config.discovery_interval.as_secs(),
         state_poll_seconds = config.state_poll_interval.as_secs(),
         "SHOCS Light Controller starting"
@@ -96,11 +100,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let power_handle = tokio::spawn(power_schedule_task(
         Arc::clone(&client),
-        state,
+        state.clone(),
         Arc::clone(&config),
         Arc::clone(&desired_on),
     ));
 
+    let listener = TcpListener::bind(config.http_bind_addr).await?;
+    let app = web::router(WebState {
+        client: Arc::clone(&client),
+        controller: state,
+        config: Arc::clone(&config),
+    });
+
+    warn!(
+        http_bind = %config.http_bind_addr,
+        "PH1 debug web UI is unauthenticated; keep it LAN-only and do not expose it to the Internet"
+    );
+
+    let web_handle = tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, app).await {
+            error!(error = %err, "SHOCS-LC web server stopped unexpectedly");
+        }
+    });
+
+    info!(url = %format!("http://{}/", config.http_bind_addr), "SHOCS-LC web UI is listening");
     info!("SHOCS Light Controller tasks are running");
 
     tokio::signal::ctrl_c().await?;
@@ -111,6 +134,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     reconcile_handle.abort();
     color_handle.abort();
     power_handle.abort();
+    web_handle.abort();
 
     Ok(())
 }

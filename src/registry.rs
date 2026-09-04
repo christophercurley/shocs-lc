@@ -13,6 +13,15 @@ pub enum LightMode {
     Custom,
 }
 
+impl LightMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Custom => "custom",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ManagedLight {
     pub device: LifxDevice,
@@ -25,9 +34,9 @@ pub struct ManagedLight {
 
 /// Shared in-memory controller state.
 ///
-/// Web/API code will talk to this abstraction instead of reaching into the
-/// underlying map directly. Persistent configuration can be layered underneath
-/// it later without coupling callers to a database today.
+/// Web/API code talks to this abstraction instead of reaching into the
+/// underlying map directly. A persistent store can replace or back this later
+/// without coupling the rest of the controller to SQLite today.
 #[derive(Clone)]
 pub struct ControllerState {
     lights: Arc<RwLock<HashMap<LifxId, ManagedLight>>>,
@@ -48,6 +57,22 @@ impl ControllerState {
         } else {
             LightMode::Custom
         }
+    }
+
+    pub async fn lights(&self) -> Vec<ManagedLight> {
+        self.lights.read().await.values().cloned().collect()
+    }
+
+    pub async fn light(&self, id: LifxId) -> Option<ManagedLight> {
+        self.lights.read().await.get(&id).cloned()
+    }
+
+    pub async fn set_mode(&self, id: LifxId, mode: LightMode) -> Option<LightMode> {
+        let mut lights = self.lights.write().await;
+        let light = lights.get_mut(&id)?;
+        let previous = light.mode;
+        light.mode = mode;
+        Some(previous)
     }
 
     pub async fn known_devices(&self) -> Vec<LifxDevice> {
