@@ -8,7 +8,8 @@ use chrono::NaiveTime;
 use chrono_tz::Tz;
 use lifx::LifxId;
 
-const DEFAULT_DISCOVERY_INTERVAL_SECS: u64 = 30;
+const DEFAULT_DISCOVERY_INTERVAL_SECS: u64 = 60;
+const DEFAULT_STATE_POLL_INTERVAL_SECS: u64 = 10;
 const DEFAULT_COLOR_INTERVAL_SECS: u64 = 10 * 60;
 const DEFAULT_TRANSITION_SECS: u64 = 5;
 const DEFAULT_TIMEZONE: &str = "America/New_York";
@@ -19,8 +20,9 @@ const DEFAULT_ON_TIME: &str = "10:00";
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub lifx_broadcast_addr: SocketAddr,
-    pub controlled_ids: Vec<LifxId>,
+    pub initial_test_ids: Vec<LifxId>,
     pub discovery_interval: Duration,
+    pub state_poll_interval: Duration,
     pub color_interval: Duration,
     pub transition: Duration,
     pub timezone: Tz,
@@ -43,11 +45,20 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr = required_socket_addr("SHOCS_LC_BIND")?;
         let lifx_broadcast_addr = required_socket_addr("SHOCS_LC_LIFX_BROADCAST")?;
-        let controlled_ids = required_lifx_ids("SHOCS_LC_CONTROLLED_IDS")?;
+
+        // Keep the existing environment-variable name for compatibility. Its
+        // meaning is now "lights that start in Test Mode" rather than a global
+        // list of every light SHOCS is allowed to know about.
+        let initial_test_ids = required_lifx_ids("SHOCS_LC_CONTROLLED_IDS")?;
 
         let discovery_interval = Duration::from_secs(optional_u64(
             "SHOCS_LC_DISCOVERY_INTERVAL_SECS",
             DEFAULT_DISCOVERY_INTERVAL_SECS,
+        )?);
+
+        let state_poll_interval = Duration::from_secs(optional_u64(
+            "SHOCS_LC_STATE_POLL_INTERVAL_SECS",
+            DEFAULT_STATE_POLL_INTERVAL_SECS,
         )?);
 
         let color_interval = Duration::from_secs(optional_u64(
@@ -76,6 +87,12 @@ impl Config {
             ));
         }
 
+        if state_poll_interval.is_zero() {
+            return Err(ConfigError(
+                "SHOCS_LC_STATE_POLL_INTERVAL_SECS must be greater than zero".into(),
+            ));
+        }
+
         if color_interval.is_zero() {
             return Err(ConfigError(
                 "SHOCS_LC_COLOR_INTERVAL_SECS must be greater than zero".into(),
@@ -85,8 +102,9 @@ impl Config {
         Ok(Self {
             bind_addr,
             lifx_broadcast_addr,
-            controlled_ids,
+            initial_test_ids,
             discovery_interval,
+            state_poll_interval,
             color_interval,
             transition,
             timezone,

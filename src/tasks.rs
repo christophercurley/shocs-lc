@@ -1,12 +1,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use chrono::Utc;
 use lifx::{Color, LifxClient, Power};
 use tokio::time::sleep;
+use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
-use crate::registry::{DeviceRegistry, refresh_registry, resolve_devices};
+use crate::registry::{ControllerState, LightMode, refresh_registry};
 use crate::schedule::{desired_power_now, next_power_boundary};
 
 const COLORS: [(&str, Color); 9] = [
@@ -21,16 +23,16 @@ const COLORS: [(&str, Color); 9] = [
     ("Violet", Color::new(49_151, 48_000, 55_000, 3_500)),
 ];
 
-pub async fn apply_desired_power(
+pub async fn apply_test_power(
     client: &LifxClient,
-    registry: &DeviceRegistry,
+    state: &ControllerState,
     config: &Config,
     power: Power,
 ) {
-    let devices = resolve_devices(registry, &config.controlled_ids).await;
+    let devices = state.devices_in_mode(LightMode::Test).await;
 
     if devices.is_empty() {
-        println!("No controlled LIFX devices are currently in the registry.");
+        debug!("Test Mode power update skipped: no enrolled lights");
         return;
     }
 
@@ -38,53 +40,132 @@ pub async fn apply_desired_power(
         .set_power_many(&devices, power, config.transition)
         .await
     {
-        Ok(()) => println!(
-            "Applied desired power {:?} to {} controlled device(s).",
-            power,
-            devices.len()
+        Ok(()) => info!(
+            power = ?power,
+            lights = devices.len(),
+            transition_seconds = config.transition.as_secs(),
+            "applied Test Mode power"
         ),
-        Err(err) => eprintln!("Failed to apply desired power {:?}: {}", power, err),
+        Err(err) => warn!(
+            power = ?power,
+            error = %err,
+            "failed to apply Test Mode power"
+        ),
     }
 }
 
-pub async fn discovery_task(
-    client: Arc<LifxClient>,
-    registry: DeviceRegistry,
-    config: Arc<Config>,
-    desired_on: Arc<AtomicBool>,
-) {
+pub async fn poll_light_states(client: &LifxClient, state: &ControllerState) -> usize {
+    let devices = state.known_devices().await;
+    let mut updated = 0usize;
+
+    for device in devices {
+        match client.get_light_state(&device).await {
+            Ok(observed) => {
+                if let Some(changed) = state.record_observation(device.id, observed).await {
+                    updated += 1;
+
+                    if changed {
+                        debug!(
+                            lifx_id = %format!("{:#018x}", device.id),
+                            power = ?observed.power,
+                            hue = observed.hue,
+                            saturation = observed.saturation,
+                            brightness = observed.brightness,
+                            kelvin = observed.kelvin,
+                            "observed LIFX state changed"
+                        );
+                    } else {
+                        trace!(
+                            lifx_id = %format!("{:#018x}", device.id),
+                            "observed LIFX state unchanged"
+                        );
+                    }
+                }
+            }
+            Err(err) => trace!(
+                lifx_id = %format!("{:#018x}", device.id),
+                address = %device.addr,
+                error = %err,
+                "LIFX state poll failed"
+            ),
+        }
+    }
+
+    updated
+}
+
+pub async fn discovery_task(client: Arc<LifxClient>, state: ControllerState, config: Arc<Config>) {
     loop {
         sleep(config.discovery_interval).await;
 
-        println!("Running scheduled LIFX discovery...");
-
-        match refresh_registry(&client, &registry).await {
-            Ok(count) => {
-                println!("Discovery saw {count} LIFX device(s).");
-
-                let power = if desired_on.load(Ordering::Relaxed) {
-                    Power::On
-                } else {
-                    Power::Off
-                };
-
-                // Primitive desired-state reconciliation. A bulb that reboots
-                // into the wrong power state gets corrected on the next scan.
-                apply_desired_power(&client, &registry, &config, power).await;
-            }
-            Err(err) => eprintln!("LIFX discovery failed: {err}"),
+        match refresh_registry(&client, &state).await {
+            Ok(count) => debug!(devices = count, "scheduled LIFX discovery finished"),
+            Err(err) => warn!(error = %err, "scheduled LIFX discovery failed"),
         }
     }
 }
 
-pub async fn color_task(client: Arc<LifxClient>, registry: DeviceRegistry, config: Arc<Config>) {
+pub async fn state_poll_task(client: Arc<LifxClient>, state: ControllerState, config: Arc<Config>) {
+    loop {
+        sleep(config.state_poll_interval).await;
+        let updated = poll_light_states(&client, &state).await;
+        trace!(updated, "scheduled LIFX state poll finished");
+    }
+}
+
+pub async fn test_reconcile_task(
+    client: Arc<LifxClient>,
+    state: ControllerState,
+    config: Arc<Config>,
+    desired_on: Arc<AtomicBool>,
+) {
+    // Offset this slightly from the state poll so reconciliation normally acts
+    // on a fresh physical observation instead of racing the poll timer.
+    let interval = config.state_poll_interval + Duration::from_secs(1);
+
+    loop {
+        sleep(interval).await;
+
+        let desired = if desired_on.load(Ordering::Relaxed) {
+            Power::On
+        } else {
+            Power::Off
+        };
+
+        let devices = state
+            .devices_with_power_mismatch(LightMode::Test, desired)
+            .await;
+
+        if devices.is_empty() {
+            continue;
+        }
+
+        match client
+            .set_power_many(&devices, desired, config.transition)
+            .await
+        {
+            Ok(()) => info!(
+                power = ?desired,
+                lights = devices.len(),
+                "reconciled Test Mode power after observed mismatch"
+            ),
+            Err(err) => warn!(
+                power = ?desired,
+                error = %err,
+                "Test Mode power reconciliation failed"
+            ),
+        }
+    }
+}
+
+pub async fn color_task(client: Arc<LifxClient>, state: ControllerState, config: Arc<Config>) {
     let mut color_index = 0usize;
 
     loop {
-        let devices = resolve_devices(&registry, &config.controlled_ids).await;
+        let devices = state.devices_in_mode(LightMode::Test).await;
 
         if devices.is_empty() {
-            println!("Color heartbeat skipped: no controlled devices in registry.");
+            debug!("Test Mode color heartbeat skipped: no enrolled lights");
         } else {
             let (name, color) = COLORS[color_index];
 
@@ -92,13 +173,13 @@ pub async fn color_task(client: Arc<LifxClient>, registry: DeviceRegistry, confi
                 .set_color_many(&devices, color, config.transition)
                 .await
             {
-                Ok(()) => println!(
-                    "Color heartbeat: fading {} controlled device(s) to {} over {} seconds.",
-                    devices.len(),
-                    name,
-                    config.transition.as_secs()
+                Ok(()) => info!(
+                    lights = devices.len(),
+                    color = name,
+                    transition_seconds = config.transition.as_secs(),
+                    "Test Mode color heartbeat"
                 ),
-                Err(err) => eprintln!("Color heartbeat failed: {err}"),
+                Err(err) => warn!(error = %err, "Test Mode color heartbeat failed"),
             }
 
             color_index = (color_index + 1) % COLORS.len();
@@ -110,7 +191,7 @@ pub async fn color_task(client: Arc<LifxClient>, registry: DeviceRegistry, confi
 
 pub async fn power_schedule_task(
     client: Arc<LifxClient>,
-    registry: DeviceRegistry,
+    state: ControllerState,
     config: Arc<Config>,
     desired_on: Arc<AtomicBool>,
 ) {
@@ -119,8 +200,8 @@ pub async fn power_schedule_task(
             match next_power_boundary(config.timezone, config.off_time, config.on_time) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Could not calculate next power boundary: {err}");
-                    sleep(std::time::Duration::from_secs(60)).await;
+                    warn!(error = %err, "could not calculate next Test Mode power boundary");
+                    sleep(Duration::from_secs(60)).await;
                     continue;
                 }
             };
@@ -130,24 +211,23 @@ pub async fn power_schedule_task(
 
         let wait = match (boundary_utc - now).to_std() {
             Ok(value) => value,
-            Err(_) => std::time::Duration::ZERO,
+            Err(_) => Duration::ZERO,
         };
 
-        println!(
-            "Next power boundary: {} -> {:?}",
-            boundary.format("%Y-%m-%d %H:%M:%S %Z"),
-            power
+        info!(
+            boundary = %boundary.format("%Y-%m-%d %H:%M:%S %Z"),
+            power = ?power,
+            "next Test Mode power boundary"
         );
 
         sleep(wait).await;
 
         desired_on.store(matches!(power, Power::On), Ordering::Relaxed);
+        info!(power = ?power, "Test Mode power boundary reached");
+        apply_test_power(&client, &state, &config, power).await;
 
-        println!("Power schedule boundary reached: {:?}.", power);
-        apply_desired_power(&client, &registry, &config, power).await;
-
-        // Re-evaluate from civil time after each boundary instead of assuming
-        // the previous monotonic sleep remains authoritative forever.
+        // Re-evaluate civil time after every boundary so DST and wall-clock
+        // behavior remain authoritative rather than assuming a fixed cadence.
         let current = desired_power_now(config.timezone, config.off_time, config.on_time);
         desired_on.store(matches!(current, Power::On), Ordering::Relaxed);
     }
