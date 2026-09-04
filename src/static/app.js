@@ -35,6 +35,69 @@ async function api(url, options = {}) {
   return response;
 }
 
+function createLiveControlSender(url, { onError, onCommit }) {
+  const intervalMs = 100; // Cap live control traffic at about 10 Hz.
+  let pending = null;
+  let inFlight = false;
+  let timer = null;
+  let lastSentAt = 0;
+
+  async function transmit() {
+    if (inFlight || pending === null) return;
+
+    const payload = pending;
+    pending = null;
+    inFlight = true;
+    lastSentAt = performance.now();
+
+    try {
+      await api(url, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+
+      if (payload.final && onCommit) onCommit(payload);
+    } catch (error) {
+      onError(error);
+    } finally {
+      inFlight = false;
+      if (pending !== null) schedule();
+    }
+  }
+
+  function schedule() {
+    if (inFlight || timer !== null || pending === null) return;
+
+    const elapsed = performance.now() - lastSentAt;
+    const delay = Math.max(0, intervalMs - elapsed);
+    timer = setTimeout(() => {
+      timer = null;
+      transmit();
+    }, delay);
+  }
+
+  return {
+    update(payload) {
+      // Latest-wins coalescing prevents a fast drag from building a backlog.
+      pending = { ...payload, final: false };
+      schedule();
+    },
+
+    commit(payload) {
+      pending = { ...payload, final: true };
+
+      // If nothing is currently in flight, the release event should go now.
+      if (!inFlight) {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        transmit();
+      }
+    },
+  };
+}
+
 function createSwitch(checked, label, onChange) {
   const wrapper = document.createElement("label");
   wrapper.className = "switch";
@@ -116,7 +179,7 @@ function createCard(light) {
   brightnessHeading.innerHTML = `
     <div class="control-copy">
       <span class="control-label">Brightness</span>
-      <span class="control-help">Sends when you release the slider.</span>
+      <span class="control-help">Live control · updates up to 10 times per second.</span>
     </div>
   `;
   const brightnessValue = document.createElement("span");
@@ -130,25 +193,32 @@ function createCard(light) {
   slider.max = "100";
   slider.step = "1";
   slider.setAttribute("aria-label", "Brightness");
+  const brightnessSender = createLiveControlSender(
+    `/api/lights/${encodeURIComponent(light.id)}/brightness`,
+    {
+      onError(error) {
+        showToast(error.message, true);
+      },
+      async onCommit(payload) {
+        showToast(`${name.textContent}: brightness ${payload.percent}%`);
+        await refreshLights();
+      },
+    },
+  );
+
   slider.addEventListener("input", () => {
-    brightnessValue.textContent = `${slider.value}%`;
-  });
-  slider.addEventListener("change", async () => {
     const desired = Number(slider.value);
-    slider.disabled = true;
-    try {
-      await api(`/api/lights/${encodeURIComponent(light.id)}/brightness`, {
-        method: "PUT",
-        body: JSON.stringify({ percent: desired }),
-      });
-      showToast(`${name.textContent}: brightness ${desired}%`);
-      await refreshLights();
-    } catch (error) {
-      showToast(error.message, true);
-      await refreshLights();
-    } finally {
-      slider.disabled = false;
-    }
+    brightnessValue.textContent = `${desired}%`;
+
+    // A manual lighting command exits Test Mode immediately. The next API
+    // refresh will confirm the controller state, but update the toggle now so
+    // the UI never suggests that automation is still authoritative.
+    testSwitch.input.checked = false;
+    brightnessSender.update({ percent: desired });
+  });
+
+  slider.addEventListener("change", () => {
+    brightnessSender.commit({ percent: Number(slider.value) });
   });
 
   brightnessRow.append(brightnessHeading, slider);

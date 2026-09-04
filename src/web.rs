@@ -16,6 +16,7 @@ use crate::registry::{ControllerState, LightMode, ManagedLight};
 use crate::schedule::desired_power_now;
 
 const MANUAL_TRANSITION: Duration = Duration::from_millis(250);
+const LIVE_CONTROL_TRANSITION: Duration = Duration::from_millis(100);
 const MANUAL_CONFIRM_DELAY: Duration = Duration::from_millis(350);
 
 #[derive(Clone)]
@@ -73,7 +74,7 @@ struct LightView {
 
 async fn list_lights(State(state): State<WebState>) -> Json<Vec<LightView>> {
     let mut lights = state.controller.lights().await;
-    lights.sort_by(|a, b| sort_name(a).cmp(&sort_name(b)));
+    lights.sort_by_key(sort_name);
 
     let online_window = state.config.state_poll_interval.saturating_mul(3);
     let views = lights
@@ -127,6 +128,8 @@ async fn set_power(
 #[derive(Debug, Deserialize)]
 struct BrightnessRequest {
     percent: u8,
+    #[serde(default, rename = "final")]
+    final_update: bool,
 }
 
 async fn set_brightness(
@@ -145,15 +148,27 @@ async fn set_brightness(
         .await
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
 
-    state.controller.set_mode(id, LightMode::Custom).await;
+    let previous_mode = state.controller.set_mode(id, LightMode::Custom).await;
 
-    // Brightness is encoded inside LIFX HSBK, so read the bulb immediately
-    // before the write to avoid accidentally restoring a stale hue or kelvin.
-    let observed = state
-        .client
-        .get_light_state(&light.device)
-        .await
-        .map_err(ApiError::lifx)?;
+    if previous_mode == Some(LightMode::Test) {
+        info!(
+            lifx_id = %format!("{id:#018x}"),
+            "manual live control moved light from Test to Custom mode"
+        );
+    }
+
+    // Live sliders can issue up to ~10 commands per second. Re-querying the
+    // bulb before every command would add latency and serialize the stream on
+    // the shared UDP socket, so preserve hue/saturation/kelvin from the most
+    // recent observation instead. The normal state poll keeps this cache fresh.
+    let observed = match light.observed {
+        Some(observed) => observed,
+        None => state
+            .client
+            .get_light_state(&light.device)
+            .await
+            .map_err(ApiError::lifx)?,
+    };
 
     let brightness = percent_to_u16(request.percent);
     let color = Color::new(
@@ -165,18 +180,28 @@ async fn set_brightness(
 
     state
         .client
-        .set_color(&light.device, color, MANUAL_TRANSITION)
+        .set_color(&light.device, color, LIVE_CONTROL_TRANSITION)
         .await
         .map_err(ApiError::lifx)?;
 
-    confirm_observation(&state, id, &light).await;
+    // Intermediate slider updates stay fast and fire-and-forget. Only the
+    // release/final update waits for a physical readback and emits an INFO log.
+    if request.final_update {
+        confirm_observation(&state, id, &light).await;
 
-    info!(
-        lifx_id = %format!("{id:#018x}"),
-        brightness_percent = request.percent,
-        mode = "custom",
-        "manual web brightness command"
-    );
+        info!(
+            lifx_id = %format!("{id:#018x}"),
+            brightness_percent = request.percent,
+            mode = "custom",
+            "manual web brightness command committed"
+        );
+    } else {
+        trace!(
+            lifx_id = %format!("{id:#018x}"),
+            brightness_percent = request.percent,
+            "manual web brightness live update"
+        );
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
