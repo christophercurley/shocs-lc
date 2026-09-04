@@ -86,7 +86,6 @@ function createLiveControlSender(url, { onError, onCommit }) {
     commit(payload) {
       pending = { ...payload, final: true };
 
-      // If nothing is currently in flight, the release event should go now.
       if (!inFlight) {
         if (timer !== null) {
           clearTimeout(timer);
@@ -101,6 +100,53 @@ function createLiveControlSender(url, { onError, onCommit }) {
 function setBrightnessVisual(slider, percent) {
   const clamped = Math.max(0, Math.min(100, Number(percent)));
   slider.style.setProperty("--brightness-fill", `${clamped}%`);
+}
+
+function renderBrightness(refs, percent) {
+  const clamped = Math.max(0, Math.min(100, Number(percent)));
+  refs.slider.value = String(clamped);
+  refs.brightnessValue.textContent = `${Math.round(clamped)}%`;
+  setBrightnessVisual(refs.slider, clamped);
+}
+
+function cancelBrightnessAnimation(refs) {
+  if (refs.brightnessAnimationFrame !== null) {
+    cancelAnimationFrame(refs.brightnessAnimationFrame);
+    refs.brightnessAnimationFrame = null;
+  }
+}
+
+function animateBrightness(refs, fromPercent, toPercent, remainingMs) {
+  cancelBrightnessAnimation(refs);
+
+  const duration = Math.max(0, Number(remainingMs));
+  const from = Number(fromPercent);
+  const to = Number(toPercent);
+
+  if (duration <= 0 || Math.abs(to - from) < 0.01) {
+    renderBrightness(refs, to);
+    return;
+  }
+
+  const startedAt = performance.now();
+
+  function frame(now) {
+    if (refs.brightnessInteracting) {
+      refs.brightnessAnimationFrame = null;
+      return;
+    }
+
+    const progress = Math.min(1, (now - startedAt) / duration);
+    renderBrightness(refs, from + (to - from) * progress);
+
+    if (progress < 1) {
+      refs.brightnessAnimationFrame = requestAnimationFrame(frame);
+    } else {
+      refs.brightnessAnimationFrame = null;
+    }
+  }
+
+  refs.brightnessAnimationFrame = requestAnimationFrame(frame);
 }
 
 function createSwitch(checked, label, onChange) {
@@ -157,21 +203,27 @@ function createCard(light) {
     </div>
   `;
 
+  let refs;
+
   const powerSwitch = createSwitch(Boolean(light.power_on), "Power", async (input) => {
     const desired = input.checked;
+    refs.powerPending = true;
+    refs.lastPowerMutationAt = performance.now();
     input.disabled = true;
+
     try {
       await api(`/api/lights/${encodeURIComponent(light.id)}/power`, {
         method: "PUT",
         body: JSON.stringify({ on: desired }),
       });
       showToast(`${name.textContent}: ${desired ? "on" : "off"}`);
-      await refreshLights();
     } catch (error) {
       input.checked = !desired;
       showToast(error.message, true);
     } finally {
+      refs.powerPending = false;
       input.disabled = false;
+      await refreshLights();
     }
   });
   powerRow.append(powerSwitch.wrapper);
@@ -198,6 +250,7 @@ function createCard(light) {
   slider.max = "100";
   slider.step = "1";
   slider.setAttribute("aria-label", "Brightness");
+
   const brightnessSender = createLiveControlSender(
     `/api/lights/${encodeURIComponent(light.id)}/brightness`,
     {
@@ -211,20 +264,38 @@ function createCard(light) {
     },
   );
 
-  slider.addEventListener("input", () => {
-    const desired = Number(slider.value);
-    brightnessValue.textContent = `${desired}%`;
-    setBrightnessVisual(slider, desired);
+  slider.addEventListener("pointerdown", () => {
+    refs.brightnessInteracting = true;
+    cancelBrightnessAnimation(refs);
+  });
 
-    // A manual brightness command exits Test Mode immediately. The next API
-    // refresh will confirm the controller state, but update the toggle now so
-    // the UI never suggests that automation is still authoritative.
+  slider.addEventListener("input", () => {
+    refs.brightnessInteracting = true;
+    cancelBrightnessAnimation(refs);
+
+    const desired = Math.round(Number(slider.value));
+    renderBrightness(refs, desired);
+
+    // Manual brightness still means the user is taking direct control.
     testSwitch.input.checked = false;
     brightnessSender.update({ percent: desired });
   });
 
   slider.addEventListener("change", () => {
-    brightnessSender.commit({ percent: Number(slider.value) });
+    const desired = Math.round(Number(slider.value));
+    refs.brightnessInteracting = false;
+    renderBrightness(refs, desired);
+    brightnessSender.commit({ percent: desired });
+  });
+
+  slider.addEventListener("pointerup", () => {
+    refs.brightnessInteracting = false;
+  });
+  slider.addEventListener("pointercancel", () => {
+    refs.brightnessInteracting = false;
+  });
+  slider.addEventListener("blur", () => {
+    refs.brightnessInteracting = false;
   });
 
   brightnessRow.append(brightnessHeading, slider);
@@ -240,19 +311,23 @@ function createCard(light) {
 
   const testSwitch = createSwitch(light.mode === "test", "Test Mode", async (input) => {
     const desired = input.checked;
+    refs.modePending = true;
+    refs.lastModeMutationAt = performance.now();
     input.disabled = true;
+
     try {
       await api(`/api/lights/${encodeURIComponent(light.id)}/mode`, {
         method: "PUT",
         body: JSON.stringify({ test: desired }),
       });
       showToast(`${name.textContent}: ${desired ? "Test" : "Custom"} mode`);
-      await refreshLights();
     } catch (error) {
       input.checked = !desired;
       showToast(error.message, true);
     } finally {
+      refs.modePending = false;
       input.disabled = false;
+      await refreshLights();
     }
   });
   testRow.append(testSwitch.wrapper);
@@ -260,17 +335,23 @@ function createCard(light) {
   controls.append(powerRow, brightnessRow, testRow);
   card.append(header, controls);
 
-  const refs = {
+  refs = {
     card,
     name,
     meta,
     badge,
     badgeText,
     powerInput: powerSwitch.input,
+    powerPending: false,
+    lastPowerMutationAt: 0,
     brightnessRow,
     brightnessValue,
     slider,
+    brightnessInteracting: false,
+    brightnessAnimationFrame: null,
     testInput: testSwitch.input,
+    modePending: false,
+    lastModeMutationAt: 0,
   };
 
   cards.set(light.id, refs);
@@ -278,7 +359,7 @@ function createCard(light) {
   return refs;
 }
 
-function updateCard(light) {
+function updateCard(light, refreshStartedAt) {
   const refs = cards.get(light.id) || createCard(light);
   refs.name.textContent = light.label;
   refs.meta.textContent = `${light.id} · ${light.address}`;
@@ -287,24 +368,51 @@ function updateCard(light) {
   refs.badgeText.textContent = light.online ? "Online" : "Offline";
 
   const hasState = light.power_on !== null && light.brightness_percent !== null;
-  refs.powerInput.disabled = !hasState;
-  if (hasState) refs.powerInput.checked = light.power_on;
+  refs.powerInput.disabled = !hasState || refs.powerPending;
+
+  // Ignore GET responses that were already in flight when the user clicked.
+  // This prevents the classic OFF -> ON -> OFF visual bounce.
+  if (
+    hasState &&
+    !refs.powerPending &&
+    refreshStartedAt >= refs.lastPowerMutationAt
+  ) {
+    refs.powerInput.checked = light.power_on;
+  }
 
   refs.brightnessRow.classList.toggle("is-disabled", !hasState);
   refs.slider.disabled = !hasState;
-  if (hasState && document.activeElement !== refs.slider) {
-    refs.slider.value = String(light.brightness_percent);
-    refs.brightnessValue.textContent = `${light.brightness_percent}%`;
-    setBrightnessVisual(refs.slider, light.brightness_percent);
-  } else if (!hasState) {
+
+  if (!hasState) {
+    cancelBrightnessAnimation(refs);
     refs.brightnessValue.textContent = "—";
     setBrightnessVisual(refs.slider, 0);
+  } else if (!refs.brightnessInteracting) {
+    const transition = light.brightness_transition;
+    if (transition && transition.remaining_ms > 0) {
+      animateBrightness(
+        refs,
+        light.brightness_percent,
+        transition.to_percent,
+        transition.remaining_ms,
+      );
+    } else {
+      cancelBrightnessAnimation(refs);
+      renderBrightness(refs, light.brightness_percent);
+    }
   }
 
-  refs.testInput.checked = light.mode === "test";
+  if (
+    !refs.modePending &&
+    refreshStartedAt >= refs.lastModeMutationAt
+  ) {
+    refs.testInput.checked = light.mode === "test";
+  }
 }
 
 async function refreshLights() {
+  const refreshStartedAt = performance.now();
+
   try {
     const response = await fetch("/api/lights", { cache: "no-store" });
     if (!response.ok) throw new Error(`Could not load lights (${response.status})`);
@@ -314,10 +422,11 @@ async function refreshLights() {
 
     document.querySelector("#loading-card")?.remove();
 
-    for (const light of lights) updateCard(light);
+    for (const light of lights) updateCard(light, refreshStartedAt);
 
     for (const [id, refs] of cards) {
       if (!seen.has(id)) {
+        cancelBrightnessAnimation(refs);
         refs.card.remove();
         cards.delete(id);
       }

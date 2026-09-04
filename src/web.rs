@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
@@ -72,6 +72,13 @@ struct LightView {
     mode: &'static str,
     power_on: Option<bool>,
     brightness_percent: Option<u8>,
+    brightness_transition: Option<BrightnessTransitionView>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrightnessTransitionView {
+    to_percent: u8,
+    remaining_ms: u64,
 }
 
 async fn list_lights(State(state): State<WebState>) -> Json<Vec<LightView>> {
@@ -119,12 +126,22 @@ async fn set_power(
     } else {
         light.power_override
     };
+    let previous_desired = state
+        .controller
+        .set_desired_power(id, Some(power))
+        .await
+        .flatten();
 
     if let Err(err) = state
         .client
         .set_power(&light.device, power, MANUAL_TRANSITION)
         .await
     {
+        let _ = state
+            .controller
+            .set_desired_power(id, previous_desired)
+            .await;
+
         if light.mode == LightMode::Test {
             let _ = state
                 .controller
@@ -208,6 +225,11 @@ async fn set_brightness(
         .await
         .map_err(ApiError::lifx)?;
 
+    state
+        .controller
+        .set_desired_brightness(id, brightness)
+        .await;
+
     // Intermediate slider updates stay fast and fire-and-forget. Only the
     // release/final update waits for a physical readback and emits an INFO log.
     if request.final_update {
@@ -274,6 +296,7 @@ async fn set_mode(
 
         // Joining a mode means adopting its complete current desired state.
         // This keeps every enrolled light synchronized immediately.
+        let transition_started = Instant::now();
         if let Err(err) = sync_light_to_test_mode(
             &state.client,
             &light.device,
@@ -290,6 +313,17 @@ async fn set_mode(
                 .await;
             return Err(ApiError::lifx(err));
         }
+
+        state.controller.set_desired_power(id, Some(power)).await;
+        state
+            .controller
+            .begin_brightness_transition(
+                id,
+                color.brightness,
+                state.config.transition,
+                transition_started,
+            )
+            .await;
 
         info!(
             lifx_id = %format!("{id:#018x}"),
@@ -346,14 +380,29 @@ fn to_light_view(light: ManagedLight, online_window: Duration) -> LightView {
     let online = light
         .last_observed
         .is_some_and(|seen| seen.elapsed() <= online_window);
+    let now = Instant::now();
 
-    let (power_on, brightness_percent) = match light.observed {
-        Some(observed) => (
-            Some(matches!(observed.power, Power::On)),
-            Some(u16_to_percent(observed.brightness)),
-        ),
-        None => (None, None),
-    };
+    // Interactive controls render SHOCS's current command/intent while the
+    // physical observation catches up. Observed state remains available for
+    // reconciliation and confirmation instead of making the UI bounce.
+    let power_on = light
+        .desired_power
+        .or_else(|| light.observed.map(|state| state.power))
+        .map(|power| matches!(power, Power::On));
+
+    let brightness_percent = light.projected_brightness(now).map(u16_to_percent);
+
+    let brightness_transition = light
+        .brightness_transition
+        .as_ref()
+        .filter(|transition| transition.is_active(now))
+        .map(|transition| BrightnessTransitionView {
+            to_percent: u16_to_percent(transition.to),
+            remaining_ms: transition
+                .remaining(now)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        });
 
     LightView {
         id: format!("{:#018x}", light.device.id),
@@ -365,6 +414,7 @@ fn to_light_view(light: ManagedLight, online_window: Duration) -> LightView {
         mode: light.mode.as_str(),
         power_on,
         brightness_percent,
+        brightness_transition,
     }
 }
 

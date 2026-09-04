@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use lifx::{LifxClient, LifxDevice, LifxId, LightState, Power};
 use tokio::sync::RwLock;
@@ -23,11 +23,60 @@ impl LightMode {
 }
 
 #[derive(Debug, Clone)]
+pub struct BrightnessTransition {
+    pub from: u16,
+    pub to: u16,
+    pub started: Instant,
+    pub duration: Duration,
+}
+
+impl BrightnessTransition {
+    pub fn projected_value(&self, now: Instant) -> u16 {
+        if self.duration.is_zero() {
+            return self.to;
+        }
+
+        let elapsed = now.saturating_duration_since(self.started);
+        if elapsed >= self.duration {
+            return self.to;
+        }
+
+        let progress = elapsed.as_secs_f64() / self.duration.as_secs_f64();
+        let from = f64::from(self.from);
+        let to = f64::from(self.to);
+        (from + (to - from) * progress)
+            .round()
+            .clamp(0.0, f64::from(u16::MAX)) as u16
+    }
+
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.duration
+            .saturating_sub(now.saturating_duration_since(self.started))
+    }
+
+    pub fn is_active(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started) < self.duration
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ManagedLight {
     pub device: LifxDevice,
     pub label: Option<String>,
     pub mode: LightMode,
     pub observed: Option<LightState>,
+
+    /// Latest power state commanded by SHOCS. The web UI renders this while a
+    /// physical observation is catching up, which prevents toggle bounce.
+    pub desired_power: Option<Power>,
+
+    /// Latest brightness target commanded by SHOCS.
+    pub desired_brightness: Option<u16>,
+
+    /// A known in-progress brightness transition. The UI can interpolate this
+    /// locally instead of waiting for periodic physical state polls.
+    pub brightness_transition: Option<BrightnessTransition>,
+
     /// Explicit manual power choice layered over an automation mode.
     ///
     /// For Test Mode this survives heartbeats/reconciliation until the next
@@ -35,6 +84,37 @@ pub struct ManagedLight {
     pub power_override: Option<Power>,
     pub last_discovered: Instant,
     pub last_observed: Option<Instant>,
+}
+
+impl ManagedLight {
+    pub fn projected_brightness(&self, now: Instant) -> Option<u16> {
+        if let Some(transition) = self
+            .brightness_transition
+            .as_ref()
+            .filter(|transition| transition.is_active(now))
+        {
+            return Some(transition.projected_value(now));
+        }
+
+        self.desired_brightness
+            .or_else(|| self.observed.map(|state| state.brightness))
+    }
+
+    fn transition_start_brightness(&self, now: Instant) -> Option<u16> {
+        if let Some(transition) = self
+            .brightness_transition
+            .as_ref()
+            .filter(|transition| transition.is_active(now))
+        {
+            return Some(transition.projected_value(now));
+        }
+
+        // When starting a new physical transition, the latest observation is
+        // the best estimate of where the bulb is actually starting from.
+        self.observed
+            .map(|state| state.brightness)
+            .or(self.desired_brightness)
+    }
 }
 
 /// Shared in-memory controller state.
@@ -78,6 +158,93 @@ impl ControllerState {
         let previous = light.mode;
         light.mode = mode;
         Some(previous)
+    }
+
+    pub async fn set_desired_power(
+        &self,
+        id: LifxId,
+        power: Option<Power>,
+    ) -> Option<Option<Power>> {
+        let mut lights = self.lights.write().await;
+        let light = lights.get_mut(&id)?;
+        let previous = light.desired_power;
+        light.desired_power = power;
+        Some(previous)
+    }
+
+    pub async fn set_desired_power_for_mode(&self, mode: LightMode, power: Power) {
+        let mut lights = self.lights.write().await;
+        for light in lights.values_mut().filter(|light| light.mode == mode) {
+            light.desired_power = Some(power);
+        }
+    }
+
+    pub async fn set_desired_brightness(&self, id: LifxId, brightness: u16) -> Option<u16> {
+        let mut lights = self.lights.write().await;
+        let light = lights.get_mut(&id)?;
+        let previous = light.desired_brightness.unwrap_or(brightness);
+        light.desired_brightness = Some(brightness);
+        light.brightness_transition = None;
+        Some(previous)
+    }
+
+    pub async fn begin_brightness_transition(
+        &self,
+        id: LifxId,
+        target: u16,
+        duration: Duration,
+        started: Instant,
+    ) -> bool {
+        let mut lights = self.lights.write().await;
+        let Some(light) = lights.get_mut(&id) else {
+            return false;
+        };
+
+        let from = light.transition_start_brightness(started).unwrap_or(target);
+        light.desired_brightness = Some(target);
+        light.brightness_transition = if duration.is_zero() || from == target {
+            None
+        } else {
+            Some(BrightnessTransition {
+                from,
+                to: target,
+                started,
+                duration,
+            })
+        };
+
+        true
+    }
+
+    pub async fn begin_brightness_transition_for_mode(
+        &self,
+        mode: LightMode,
+        target: u16,
+        duration: Duration,
+        started: Instant,
+    ) {
+        let mut lights = self.lights.write().await;
+
+        for light in lights.values_mut().filter(|light| light.mode == mode) {
+            let from = light.transition_start_brightness(started).unwrap_or(target);
+            light.desired_brightness = Some(target);
+            light.brightness_transition = if duration.is_zero() || from == target {
+                None
+            } else {
+                Some(BrightnessTransition {
+                    from,
+                    to: target,
+                    started,
+                    duration,
+                })
+            };
+        }
+    }
+
+    pub async fn clear_brightness_transition(&self, id: LifxId) {
+        if let Some(light) = self.lights.write().await.get_mut(&id) {
+            light.brightness_transition = None;
+        }
     }
 
     pub async fn set_power_override(
@@ -159,9 +326,18 @@ impl ControllerState {
         let mut lights = self.lights.write().await;
         let light = lights.get_mut(&id)?;
         let changed = light.observed != Some(observed);
+        let now = Instant::now();
 
         light.observed = Some(observed);
-        light.last_observed = Some(Instant::now());
+        light.last_observed = Some(now);
+
+        if light
+            .brightness_transition
+            .as_ref()
+            .is_some_and(|transition| !transition.is_active(now))
+        {
+            light.brightness_transition = None;
+        }
 
         Some(changed)
     }
@@ -219,6 +395,9 @@ pub async fn refresh_registry(client: &LifxClient, state: &ControllerState) -> l
                     label,
                     mode,
                     observed: None,
+                    desired_power: None,
+                    desired_brightness: None,
+                    brightness_transition: None,
                     power_override: None,
                     last_discovered: now,
                     last_observed: None,

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use lifx::{LifxClient, LifxDevice, Power};
@@ -23,6 +23,9 @@ pub async fn apply_test_power(
     power: Power,
 ) {
     let devices = state.devices_in_mode(LightMode::Test).await;
+    state
+        .set_desired_power_for_mode(LightMode::Test, power)
+        .await;
 
     if devices.is_empty() {
         debug!("Test Mode power update skipped: no enrolled lights");
@@ -103,6 +106,8 @@ pub async fn confirm_test_mode_sync(
                 state.record_observation(device.id, observed).await;
 
                 if test_state_matches(observed, desired_color, desired_power) {
+                    state.clear_brightness_transition(device.id).await;
+
                     info!(
                         lifx_id = %format!("{:#018x}", device.id),
                         color = color_name,
@@ -140,9 +145,24 @@ pub async fn confirm_test_mode_sync(
         // Re-checking current Test state inside sync_light_to_test_mode means a
         // color heartbeat that happened during the first transition is handled
         // naturally: the retry targets whatever Test Mode owns *now*.
+        let (_, retry_color) = test_mode.current_color();
+        let retry_started = Instant::now();
+        state
+            .set_desired_power(device.id, Some(desired_power))
+            .await;
+        state
+            .begin_brightness_transition(
+                device.id,
+                retry_color.brightness,
+                config.transition,
+                retry_started,
+            )
+            .await;
+
         if let Err(err) =
             sync_light_to_test_mode(&client, &device, &config, &test_mode, desired_power).await
         {
+            state.clear_brightness_transition(device.id).await;
             warn!(
                 lifx_id = %format!("{:#018x}", device.id),
                 error = %err,
@@ -298,17 +318,29 @@ pub async fn color_task(
                 "Test Mode color heartbeat skipped: no enrolled lights"
             );
         } else {
+            let transition_started = Instant::now();
             match client
                 .set_color_many(&devices, color, config.transition)
                 .await
             {
-                Ok(()) => info!(
-                    lights = devices.len(),
-                    color = name,
-                    brightness = color.brightness,
-                    transition_seconds = config.transition.as_secs(),
-                    "Test Mode color heartbeat"
-                ),
+                Ok(()) => {
+                    state
+                        .begin_brightness_transition_for_mode(
+                            LightMode::Test,
+                            color.brightness,
+                            config.transition,
+                            transition_started,
+                        )
+                        .await;
+
+                    info!(
+                        lights = devices.len(),
+                        color = name,
+                        brightness = color.brightness,
+                        transition_seconds = config.transition.as_secs(),
+                        "Test Mode color heartbeat"
+                    );
+                }
                 Err(err) => warn!(error = %err, "Test Mode color heartbeat failed"),
             }
         }
