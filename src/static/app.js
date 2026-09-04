@@ -228,7 +228,7 @@ function createCard(light) {
   testRow.innerHTML = `
     <div class="control-copy">
       <span class="control-label">Test Mode</span>
-      <span class="control-help">10-minute color heartbeat + 02:00 / 10:00 power schedule.</span>
+      <span class="control-help">Color heartbeat + 02:00 / 10:00 power schedule.</span>
     </div>
   `;
 

@@ -27,8 +27,9 @@ services:
       # Poll live light state separately from discovery.
       SHOCS_LC_STATE_POLL_INTERVAL_SECS: "10"
 
-      # Test Mode: visible heartbeat every ten minutes with a five-second fade.
-      SHOCS_LC_COLOR_INTERVAL_SECS: "600"
+      # Test Mode: one-minute heartbeat for active UI/mode testing.
+      # Return this to 600 when the rapid test cadence is no longer useful.
+      SHOCS_LC_COLOR_INTERVAL_SECS: "60"
       SHOCS_LC_TRANSITION_SECS: "5"
 
       # Test Mode's existing proof-of-concept power schedule.

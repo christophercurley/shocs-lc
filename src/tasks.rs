@@ -1,27 +1,15 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
-use lifx::{Color, LifxClient, Power};
+use lifx::{LifxClient, LifxDevice, Power};
 use tokio::time::sleep;
 use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
 use crate::registry::{ControllerState, LightMode, refresh_registry};
 use crate::schedule::{desired_power_now, next_power_boundary};
-
-const COLORS: [(&str, Color); 9] = [
-    ("Warm White", Color::white(2_700, 55_000)),
-    ("Amber", Color::new(7_500, 50_000, 55_000, 3_500)),
-    ("Gold", Color::new(10_500, 48_000, 55_000, 3_500)),
-    ("Green", Color::new(21_845, 52_000, 55_000, 3_500)),
-    ("Teal", Color::new(27_500, 50_000, 55_000, 3_500)),
-    ("Cyan", Color::new(32_768, 50_000, 55_000, 3_500)),
-    ("Azure", Color::new(38_229, 52_000, 55_000, 3_500)),
-    ("Blue", Color::new(43_690, 52_000, 55_000, 3_500)),
-    ("Violet", Color::new(49_151, 48_000, 55_000, 3_500)),
-];
+use crate::test_mode::TestModeState;
 
 pub async fn apply_test_power(
     client: &LifxClient,
@@ -52,6 +40,25 @@ pub async fn apply_test_power(
             "failed to apply Test Mode power"
         ),
     }
+}
+
+/// Apply Test Mode's complete current desired state to one light.
+///
+/// This is used when a light joins Test Mode so it immediately matches the
+/// existing group instead of waiting for the next color or power event.
+pub async fn sync_light_to_test_mode(
+    client: &LifxClient,
+    device: &LifxDevice,
+    config: &Config,
+    test_mode: &TestModeState,
+) -> lifx::Result<()> {
+    let (_, color) = test_mode.current_color();
+    let power = test_mode.power();
+
+    client.set_color(device, color, config.transition).await?;
+    client.set_power(device, power, config.transition).await?;
+
+    Ok(())
 }
 
 pub async fn poll_light_states(client: &LifxClient, state: &ControllerState) -> usize {
@@ -94,7 +101,11 @@ pub async fn poll_light_states(client: &LifxClient, state: &ControllerState) -> 
     updated
 }
 
-pub async fn discovery_task(client: Arc<LifxClient>, state: ControllerState, config: Arc<Config>) {
+pub async fn discovery_task(
+    client: Arc<LifxClient>,
+    state: ControllerState,
+    config: Arc<Config>,
+) {
     loop {
         sleep(config.discovery_interval).await;
 
@@ -105,7 +116,11 @@ pub async fn discovery_task(client: Arc<LifxClient>, state: ControllerState, con
     }
 }
 
-pub async fn state_poll_task(client: Arc<LifxClient>, state: ControllerState, config: Arc<Config>) {
+pub async fn state_poll_task(
+    client: Arc<LifxClient>,
+    state: ControllerState,
+    config: Arc<Config>,
+) {
     loop {
         sleep(config.state_poll_interval).await;
         let updated = poll_light_states(&client, &state).await;
@@ -117,7 +132,7 @@ pub async fn test_reconcile_task(
     client: Arc<LifxClient>,
     state: ControllerState,
     config: Arc<Config>,
-    desired_on: Arc<AtomicBool>,
+    test_mode: TestModeState,
 ) {
     // Offset this slightly from the state poll so reconciliation normally acts
     // on a fresh physical observation instead of racing the poll timer.
@@ -126,12 +141,7 @@ pub async fn test_reconcile_task(
     loop {
         sleep(interval).await;
 
-        let desired = if desired_on.load(Ordering::Relaxed) {
-            Power::On
-        } else {
-            Power::Off
-        };
-
+        let desired = test_mode.power();
         let devices = state
             .devices_with_power_mismatch(LightMode::Test, desired)
             .await;
@@ -158,17 +168,19 @@ pub async fn test_reconcile_task(
     }
 }
 
-pub async fn color_task(client: Arc<LifxClient>, state: ControllerState, config: Arc<Config>) {
-    let mut color_index = 0usize;
-
+pub async fn color_task(
+    client: Arc<LifxClient>,
+    state: ControllerState,
+    config: Arc<Config>,
+    test_mode: TestModeState,
+) {
     loop {
         let devices = state.devices_in_mode(LightMode::Test).await;
+        let (name, color) = test_mode.current_color();
 
         if devices.is_empty() {
-            debug!("Test Mode color heartbeat skipped: no enrolled lights");
+            debug!(color = name, "Test Mode color heartbeat skipped: no enrolled lights");
         } else {
-            let (name, color) = COLORS[color_index];
-
             match client
                 .set_color_many(&devices, color, config.transition)
                 .await
@@ -176,16 +188,16 @@ pub async fn color_task(client: Arc<LifxClient>, state: ControllerState, config:
                 Ok(()) => info!(
                     lights = devices.len(),
                     color = name,
+                    brightness = color.brightness,
                     transition_seconds = config.transition.as_secs(),
                     "Test Mode color heartbeat"
                 ),
                 Err(err) => warn!(error = %err, "Test Mode color heartbeat failed"),
             }
-
-            color_index = (color_index + 1) % COLORS.len();
         }
 
         sleep(config.color_interval).await;
+        test_mode.advance_color();
     }
 }
 
@@ -193,7 +205,7 @@ pub async fn power_schedule_task(
     client: Arc<LifxClient>,
     state: ControllerState,
     config: Arc<Config>,
-    desired_on: Arc<AtomicBool>,
+    test_mode: TestModeState,
 ) {
     loop {
         let (boundary, power) =
@@ -222,13 +234,13 @@ pub async fn power_schedule_task(
 
         sleep(wait).await;
 
-        desired_on.store(matches!(power, Power::On), Ordering::Relaxed);
+        test_mode.set_power(power);
         info!(power = ?power, "Test Mode power boundary reached");
         apply_test_power(&client, &state, &config, power).await;
 
         // Re-evaluate civil time after every boundary so DST and wall-clock
         // behavior remain authoritative rather than assuming a fixed cadence.
         let current = desired_power_now(config.timezone, config.off_time, config.on_time);
-        desired_on.store(matches!(current, Power::On), Ordering::Relaxed);
+        test_mode.set_power(current);
     }
 }

@@ -3,13 +3,13 @@ mod logging;
 mod registry;
 mod schedule;
 mod tasks;
+mod test_mode;
 mod web;
 
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
-use lifx::{LifxClient, Power};
+use lifx::LifxClient;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -20,6 +20,7 @@ use tasks::{
     apply_test_power, color_task, discovery_task, poll_light_states, power_schedule_task,
     state_poll_task, test_reconcile_task,
 };
+use test_mode::TestModeState;
 use web::WebState;
 
 const SOURCE_ID: u32 = 0x5348_4F43; // "SHOC"
@@ -54,8 +55,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     info!(ids = %initial_test_ids, "lights configured to start in Test Mode");
 
-    let client =
-        Arc::new(LifxClient::bind(config.bind_addr, config.lifx_broadcast_addr, SOURCE_ID).await?);
+    let client = Arc::new(
+        LifxClient::bind(config.bind_addr, config.lifx_broadcast_addr, SOURCE_ID).await?,
+    );
 
     let state = ControllerState::new(&config.initial_test_ids);
 
@@ -68,7 +70,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!(devices = observed, "initial LIFX state poll finished");
 
     let initial_power = desired_power_now(config.timezone, config.off_time, config.on_time);
-    let desired_on = Arc::new(AtomicBool::new(matches!(initial_power, Power::On)));
+    let test_mode = TestModeState::new(initial_power);
 
     info!(power = ?initial_power, "current Test Mode scheduled power state");
     apply_test_power(&client, &state, &config, initial_power).await;
@@ -89,20 +91,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::clone(&client),
         state.clone(),
         Arc::clone(&config),
-        Arc::clone(&desired_on),
+        test_mode.clone(),
     ));
 
     let color_handle = tokio::spawn(color_task(
         Arc::clone(&client),
         state.clone(),
         Arc::clone(&config),
+        test_mode.clone(),
     ));
 
     let power_handle = tokio::spawn(power_schedule_task(
         Arc::clone(&client),
         state.clone(),
         Arc::clone(&config),
-        Arc::clone(&desired_on),
+        test_mode.clone(),
     ));
 
     let listener = TcpListener::bind(config.http_bind_addr).await?;
@@ -110,6 +113,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         client: Arc::clone(&client),
         controller: state,
         config: Arc::clone(&config),
+        test_mode,
     });
 
     warn!(

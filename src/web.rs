@@ -9,11 +9,12 @@ use axum::{Json, Router};
 use lifx::{Color, LifxClient, LifxId, Power};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
-use tracing::{info, trace, warn};
+use tracing::{info, trace};
 
 use crate::config::Config;
 use crate::registry::{ControllerState, LightMode, ManagedLight};
-use crate::schedule::desired_power_now;
+use crate::tasks::sync_light_to_test_mode;
+use crate::test_mode::TestModeState;
 
 const MANUAL_TRANSITION: Duration = Duration::from_millis(250);
 const LIVE_CONTROL_TRANSITION: Duration = Duration::from_millis(100);
@@ -24,6 +25,7 @@ pub struct WebState {
     pub client: Arc<LifxClient>,
     pub controller: ControllerState,
     pub config: Arc<Config>,
+    pub test_mode: TestModeState,
 }
 
 pub fn router(state: WebState) -> Router {
@@ -235,35 +237,39 @@ async fn set_mode(
         .await
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
 
+    if mode == LightMode::Test {
+        let (color_name, color) = state.test_mode.current_color();
+        let power = state.test_mode.power();
+
+        // Joining a mode means adopting its complete current desired state.
+        // This keeps every enrolled light synchronized immediately.
+        if let Err(err) = sync_light_to_test_mode(
+            &state.client,
+            &light.device,
+            &state.config,
+            &state.test_mode,
+        )
+        .await
+        {
+            state.controller.set_mode(id, previous).await;
+            return Err(ApiError::lifx(err));
+        }
+
+        info!(
+            lifx_id = %format!("{id:#018x}"),
+            color = color_name,
+            brightness = color.brightness,
+            power = ?power,
+            "synchronized light to current Test Mode state"
+        );
+    }
+
     info!(
         lifx_id = %format!("{id:#018x}"),
         previous_mode = previous.as_str(),
         mode = mode.as_str(),
         "web light mode changed"
     );
-
-    if mode == LightMode::Test {
-        let desired = desired_power_now(
-            state.config.timezone,
-            state.config.off_time,
-            state.config.on_time,
-        );
-
-        // Enrollment takes effect immediately for Test Mode's power schedule.
-        // Color joins the existing heartbeat on its next normal cycle.
-        if let Err(err) = state
-            .client
-            .set_power(&light.device, desired, state.config.transition)
-            .await
-        {
-            warn!(
-                lifx_id = %format!("{id:#018x}"),
-                power = ?desired,
-                error = %err,
-                "could not immediately apply Test Mode power after enrollment"
-            );
-        }
-    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -284,7 +290,11 @@ async fn confirm_observation(state: &WebState, id: LifxId, light: &ManagedLight)
 }
 
 fn sort_name(light: &ManagedLight) -> String {
-    light.label.as_deref().unwrap_or("").to_ascii_lowercase()
+    light
+        .label
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 fn to_light_view(light: ManagedLight, online_window: Duration) -> LightView {
