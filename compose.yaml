@@ -14,7 +14,7 @@ services:
 
       # PH1-A intentionally exposes the debug UI directly on the LAN. PH2 will
       # move Axum behind Caddy on loopback and add HTTPS/authentication.
-      SHOCS_LC_HTTP_BIND: "192.168.1.252:8080"
+      SHOCS_LC_HTTP_BIND: "192.168.1.252:9999"
 
       # These IDs begin in Test Mode on each service start. Runtime mode changes
       # made in the debug UI are intentionally in-memory only for now.
