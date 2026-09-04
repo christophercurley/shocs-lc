@@ -37,6 +37,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/lights", get(list_lights))
         .route("/api/lights/{id}/power", put(set_power))
         .route("/api/lights/{id}/brightness", put(set_brightness))
+        .route("/api/lights/{id}/color", put(set_color))
         .route("/api/lights/{id}/mode", put(set_mode))
         .with_state(state)
 }
@@ -73,6 +74,9 @@ struct LightView {
     power_on: Option<bool>,
     brightness_percent: Option<u8>,
     brightness_transition: Option<BrightnessTransitionView>,
+    hue_degrees: Option<u16>,
+    saturation_percent: Option<u8>,
+    kelvin: Option<u16>,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,8 +204,8 @@ async fn set_brightness(
 
     // Live sliders can issue up to ~10 commands per second. Re-querying the
     // bulb before every command would add latency and serialize the stream on
-    // the shared UDP socket, so preserve hue/saturation/kelvin from the most
-    // recent observation instead. The normal state poll keeps this cache fresh.
+    // the shared UDP socket, so preserve SHOCS's current color intent (falling
+    // back to the most recent physical observation).
     let observed = match light.observed {
         Some(observed) => observed,
         None => state
@@ -212,11 +216,16 @@ async fn set_brightness(
     };
 
     let brightness = percent_to_u16(request.percent);
+    let desired_color = light.desired_color;
     let color = Color::new(
-        observed.hue,
-        observed.saturation,
+        desired_color.map(|color| color.hue).unwrap_or(observed.hue),
+        desired_color
+            .map(|color| color.saturation)
+            .unwrap_or(observed.saturation),
         brightness,
-        observed.kelvin,
+        desired_color
+            .map(|color| color.kelvin)
+            .unwrap_or(observed.kelvin),
     );
 
     state
@@ -246,6 +255,103 @@ async fn set_brightness(
             lifx_id = %format!("{id:#018x}"),
             brightness_percent = request.percent,
             "manual web brightness live update"
+        );
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct ColorRequest {
+    hue_degrees: u16,
+    saturation_percent: u8,
+    #[serde(default, rename = "final")]
+    final_update: bool,
+}
+
+async fn set_color(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    Json(request): Json<ColorRequest>,
+) -> Result<StatusCode, ApiError> {
+    if request.hue_degrees > 360 {
+        return Err(ApiError::bad_request("hue must be 0-360 degrees"));
+    }
+    if request.saturation_percent > 100 {
+        return Err(ApiError::bad_request("saturation percent must be 0-100"));
+    }
+
+    let id = parse_lifx_id(&id)?;
+    let light = state
+        .controller
+        .light(id)
+        .await
+        .ok_or_else(|| ApiError::not_found("unknown light"))?;
+
+    let previous_mode = state.controller.set_mode(id, LightMode::Custom).await;
+
+    if previous_mode == Some(LightMode::Test) {
+        let _ = state.controller.set_power_override(id, None).await;
+
+        info!(
+            lifx_id = %format!("{id:#018x}"),
+            "manual color control moved light from Test to Custom mode"
+        );
+    }
+
+    // A manual color gesture owns hue/saturation but preserves the light's
+    // current SHOCS brightness intent and color temperature.
+    let observed = match light.observed {
+        Some(observed) => observed,
+        None => state
+            .client
+            .get_light_state(&light.device)
+            .await
+            .map_err(ApiError::lifx)?,
+    };
+
+    let brightness = light
+        .projected_brightness(Instant::now())
+        .unwrap_or(observed.brightness);
+    let kelvin = light
+        .desired_color
+        .map(|color| color.kelvin)
+        .unwrap_or(observed.kelvin);
+
+    let hue = hue_degrees_to_u16(request.hue_degrees);
+    let saturation = percent_to_u16(request.saturation_percent);
+    let color = Color::new(hue, saturation, brightness, kelvin);
+
+    state
+        .client
+        .set_color(&light.device, color, LIVE_CONTROL_TRANSITION)
+        .await
+        .map_err(ApiError::lifx)?;
+
+    state.controller.set_desired_color(id, color).await;
+    // Color packets also carry brightness. Freeze any prior mode transition at
+    // the projected current level so touching color never causes a brightness jump.
+    state
+        .controller
+        .set_desired_brightness(id, brightness)
+        .await;
+
+    if request.final_update {
+        confirm_observation(&state, id, &light).await;
+
+        info!(
+            lifx_id = %format!("{id:#018x}"),
+            hue_degrees = request.hue_degrees,
+            saturation_percent = request.saturation_percent,
+            mode = "custom",
+            "manual web color command committed"
+        );
+    } else {
+        trace!(
+            lifx_id = %format!("{id:#018x}"),
+            hue_degrees = request.hue_degrees,
+            saturation_percent = request.saturation_percent,
+            "manual web color live update"
         );
     }
 
@@ -314,6 +420,7 @@ async fn set_mode(
             return Err(ApiError::lifx(err));
         }
 
+        state.controller.set_desired_color(id, color).await;
         state.controller.set_desired_power(id, Some(power)).await;
         state
             .controller
@@ -404,6 +511,17 @@ fn to_light_view(light: ManagedLight, online_window: Duration) -> LightView {
                 .min(u128::from(u64::MAX)) as u64,
         });
 
+    let desired_color = light.desired_color;
+    let hue = desired_color
+        .map(|color| color.hue)
+        .or_else(|| light.observed.map(|state| state.hue));
+    let saturation = desired_color
+        .map(|color| color.saturation)
+        .or_else(|| light.observed.map(|state| state.saturation));
+    let kelvin = desired_color
+        .map(|color| color.kelvin)
+        .or_else(|| light.observed.map(|state| state.kelvin));
+
     LightView {
         id: format!("{:#018x}", light.device.id),
         label: light
@@ -415,6 +533,9 @@ fn to_light_view(light: ManagedLight, online_window: Duration) -> LightView {
         power_on,
         brightness_percent,
         brightness_transition,
+        hue_degrees: hue.map(u16_to_hue_degrees),
+        saturation_percent: saturation.map(u16_to_percent),
+        kelvin,
     }
 }
 
@@ -425,6 +546,15 @@ fn parse_lifx_id(value: &str) -> Result<LifxId, ApiError> {
         .unwrap_or(value);
 
     u64::from_str_radix(hex, 16).map_err(|_| ApiError::bad_request("invalid LIFX ID"))
+}
+
+fn hue_degrees_to_u16(degrees: u16) -> u16 {
+    let normalized = u32::from(degrees % 360);
+    ((normalized * u32::from(u16::MAX) + 180) / 360) as u16
+}
+
+fn u16_to_hue_degrees(value: u16) -> u16 {
+    (((u32::from(value) * 360 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX)) % 360) as u16
 }
 
 fn percent_to_u16(percent: u8) -> u16 {

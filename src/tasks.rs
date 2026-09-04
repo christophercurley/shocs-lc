@@ -147,6 +147,7 @@ pub async fn confirm_test_mode_sync(
         // naturally: the retry targets whatever Test Mode owns *now*.
         let (_, retry_color) = test_mode.current_color();
         let retry_started = Instant::now();
+        state.set_desired_color(device.id, retry_color).await;
         state
             .set_desired_power(device.id, Some(desired_power))
             .await;
@@ -324,6 +325,9 @@ pub async fn color_task(
                 .await
             {
                 Ok(()) => {
+                    state
+                        .set_desired_color_for_mode(LightMode::Test, color)
+                        .await;
                     state
                         .begin_brightness_transition_for_mode(
                             LightMode::Test,

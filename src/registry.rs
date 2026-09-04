@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lifx::{LifxClient, LifxDevice, LifxId, LightState, Power};
+use lifx::{Color, LifxClient, LifxDevice, LifxId, LightState, Power};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -28,6 +28,25 @@ pub struct BrightnessTransition {
     pub to: u16,
     pub started: Instant,
     pub duration: Duration,
+}
+
+/// Color intent is tracked separately from brightness because SHOCS exposes
+/// brightness as an independent live control even though LIFX carries it in HSBK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorTarget {
+    pub hue: u16,
+    pub saturation: u16,
+    pub kelvin: u16,
+}
+
+impl From<Color> for ColorTarget {
+    fn from(color: Color) -> Self {
+        Self {
+            hue: color.hue,
+            saturation: color.saturation,
+            kelvin: color.kelvin,
+        }
+    }
 }
 
 impl BrightnessTransition {
@@ -69,6 +88,11 @@ pub struct ManagedLight {
     /// Latest power state commanded by SHOCS. The web UI renders this while a
     /// physical observation is catching up, which prevents toggle bounce.
     pub desired_power: Option<Power>,
+
+    /// Latest color target commanded by SHOCS. Keeping this separate from
+    /// observed state prevents the picker/swatches from bouncing while the
+    /// physical bulb is still catching up.
+    pub desired_color: Option<ColorTarget>,
 
     /// Latest brightness target commanded by SHOCS.
     pub desired_brightness: Option<u16>,
@@ -176,6 +200,23 @@ impl ControllerState {
         let mut lights = self.lights.write().await;
         for light in lights.values_mut().filter(|light| light.mode == mode) {
             light.desired_power = Some(power);
+        }
+    }
+
+    pub async fn set_desired_color(&self, id: LifxId, color: Color) -> Option<ColorTarget> {
+        let mut lights = self.lights.write().await;
+        let light = lights.get_mut(&id)?;
+        let previous = light.desired_color;
+        light.desired_color = Some(color.into());
+        previous
+    }
+
+    pub async fn set_desired_color_for_mode(&self, mode: LightMode, color: Color) {
+        let mut lights = self.lights.write().await;
+        let target = ColorTarget::from(color);
+
+        for light in lights.values_mut().filter(|light| light.mode == mode) {
+            light.desired_color = Some(target);
         }
     }
 
@@ -396,6 +437,7 @@ pub async fn refresh_registry(client: &LifxClient, state: &ControllerState) -> l
                     mode,
                     observed: None,
                     desired_power: None,
+                    desired_color: None,
                     desired_brightness: None,
                     brightness_transition: None,
                     power_override: None,
