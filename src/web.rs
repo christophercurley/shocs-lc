@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use lifx::{Color, LifxClient, LifxId, Power};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 use crate::config::Config;
 use crate::registry::{ControllerState, LightMode, ManagedLight};
@@ -33,9 +33,13 @@ pub fn router(state: WebState) -> Router {
     Router::new()
         .route("/", get(index_page))
         .route("/lights", get(lights_page))
+        .route("/manage", get(manage_page))
         .route("/static/styles.css", get(stylesheet))
         .route("/static/app.js", get(app_javascript))
+        .route("/static/manage.js", get(manage_javascript))
         .route("/api/lights", get(list_lights))
+        .route("/api/manage/lights", get(list_managed_lights))
+        .route("/api/manage/lights/{id}", put(update_managed_light))
         .route("/api/lights/{id}/power", put(set_power))
         .route("/api/lights/{id}/brightness", put(set_brightness))
         .route("/api/lights/{id}/color", put(set_color))
@@ -49,6 +53,10 @@ async fn index_page() -> Html<&'static str> {
 
 async fn lights_page() -> Html<&'static str> {
     Html(include_str!("static/lights.html"))
+}
+
+async fn manage_page() -> Html<&'static str> {
+    Html(include_str!("static/manage.html"))
 }
 
 async fn stylesheet() -> impl IntoResponse {
@@ -65,12 +73,20 @@ async fn app_javascript() -> impl IntoResponse {
     )
 }
 
+async fn manage_javascript() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("static/manage.js"),
+    )
+}
+
 #[derive(Debug, Serialize)]
 struct LightView {
     id: String,
     label: String,
     address: String,
     online: bool,
+    control_enabled: bool,
     mode: &'static str,
     power_on: Option<bool>,
     brightness_percent: Option<u8>,
@@ -99,6 +115,196 @@ async fn list_lights(State(state): State<WebState>) -> Json<Vec<LightView>> {
     Json(views)
 }
 
+#[derive(Debug, Serialize)]
+struct ManagedLightView {
+    id: String,
+    display_name: String,
+    device_label: Option<String>,
+    friendly_name: Option<String>,
+    control_enabled: bool,
+    mode: &'static str,
+    online: bool,
+    address: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedLightUpdate {
+    friendly_name: Option<String>,
+    control_enabled: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct ManagedLightUpdateResult {
+    saved: bool,
+    label_synced: Option<bool>,
+    test_state_synced: Option<bool>,
+}
+
+async fn list_managed_lights(State(state): State<WebState>) -> Json<Vec<ManagedLightView>> {
+    let configured = state.controller.configured_lights().await;
+    let runtime = state
+        .controller
+        .lights()
+        .await
+        .into_iter()
+        .map(|light| (light.device.id, light))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let online_window = state.config.state_poll_interval.saturating_mul(3);
+    let mut views = configured
+        .into_iter()
+        .map(|stored| {
+            let runtime_light = runtime.get(&stored.id);
+            let online = runtime_light
+                .and_then(|light| light.last_observed)
+                .is_some_and(|seen| seen.elapsed() <= online_window);
+
+            ManagedLightView {
+                id: format!("{:#018x}", stored.id),
+                display_name: stored
+                    .friendly_name
+                    .clone()
+                    .or_else(|| stored.device_label.clone())
+                    .unwrap_or_else(|| format!("LIFX {:#018x}", stored.id)),
+                device_label: stored.device_label,
+                friendly_name: stored.friendly_name,
+                control_enabled: stored.control_enabled,
+                mode: stored.mode.as_str(),
+                online,
+                address: runtime_light.map(|light| light.device.addr.to_string()),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    views.sort_by_key(|light| light.display_name.to_ascii_lowercase());
+    Json(views)
+}
+
+async fn update_managed_light(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    Json(request): Json<ManagedLightUpdate>,
+) -> Result<Json<ManagedLightUpdateResult>, ApiError> {
+    let id = parse_lifx_id(&id)?;
+
+    if request.friendly_name.is_none() && request.control_enabled.is_none() {
+        return Err(ApiError::bad_request(
+            "no device-management fields were supplied",
+        ));
+    }
+
+    let mut label_synced = None;
+    let mut test_state_synced = None;
+
+    if let Some(friendly_name) = request.friendly_name {
+        let friendly_name = normalize_friendly_name(Some(friendly_name))?;
+        state
+            .controller
+            .set_friendly_name(id, friendly_name.clone())
+            .await
+            .map_err(ApiError::store)?;
+
+        if let Some(name) = friendly_name.as_deref() {
+            // Persistence is authoritative. Assume physical sync is pending
+            // until a reachable, control-enabled bulb confirms the label.
+            label_synced = Some(false);
+
+            if let Some(light) = state.controller.light(id).await {
+                if light.control_enabled {
+                    match state.client.set_label(&light.device, name).await {
+                        Ok(confirmed) => {
+                            state
+                                .controller
+                                .record_device_label(id, Some(confirmed.clone()))
+                                .await
+                                .map_err(ApiError::store)?;
+                            label_synced = Some(true);
+
+                            info!(
+                                lifx_id = %format!("{id:#018x}"),
+                                label = %confirmed,
+                                "SHOCS friendly name mirrored to physical LIFX label"
+                            );
+                        }
+                        Err(err) => {
+                            label_synced = Some(false);
+                            warn!(
+                                lifx_id = %format!("{id:#018x}"),
+                                desired_label = %name,
+                                error = %err,
+                                "friendly name persisted; physical label sync will retry later"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(control_enabled) = request.control_enabled {
+        state
+            .controller
+            .set_control_enabled(id, control_enabled)
+            .await
+            .map_err(ApiError::store)?;
+
+        info!(
+            lifx_id = %format!("{id:#018x}"),
+            control_enabled,
+            "light control-enabled state changed"
+        );
+
+        if control_enabled {
+            if let Some(light) = state.controller.light(id).await {
+                // Re-enabling control is also a convenient opportunity to
+                // reconcile the desired SHOCS name immediately.
+                if let Some(name) = light.friendly_name.as_deref() {
+                    if light.label.as_deref() != Some(name) {
+                        match state.client.set_label(&light.device, name).await {
+                            Ok(confirmed) => {
+                                state
+                                    .controller
+                                    .record_device_label(id, Some(confirmed))
+                                    .await
+                                    .map_err(ApiError::store)?;
+                                label_synced = Some(true);
+                            }
+                            Err(err) => {
+                                label_synced = Some(false);
+                                warn!(
+                                    lifx_id = %format!("{id:#018x}"),
+                                    error = %err,
+                                    "re-enabled light but physical label sync is pending"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if light.mode == LightMode::Test {
+                    match start_test_mode_sync(&state, id, &light).await {
+                        Ok(()) => test_state_synced = Some(true),
+                        Err(err) => {
+                            test_state_synced = Some(false);
+                            warn!(
+                                lifx_id = %format!("{id:#018x}"),
+                                error = %err,
+                                "re-enabled Test light; full mode sync will retry through normal automation"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(ManagedLightUpdateResult {
+        saved: true,
+        label_synced,
+        test_state_synced,
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 struct PowerRequest {
     on: bool,
@@ -115,6 +321,8 @@ async fn set_power(
         .light(id)
         .await
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
+
+    require_control_enabled(&light)?;
 
     let power = if request.on { Power::On } else { Power::Off };
 
@@ -191,6 +399,8 @@ async fn set_brightness(
         .light(id)
         .await
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
+
+    require_control_enabled(&light)?;
 
     let previous_mode = state
         .controller
@@ -293,6 +503,8 @@ async fn set_color(
         .await
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
 
+    require_control_enabled(&light)?;
+
     let previous_mode = state
         .controller
         .set_mode(id, LightMode::Custom)
@@ -384,6 +596,8 @@ async fn set_mode(
         .await
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
 
+    require_control_enabled(&light)?;
+
     let mode = if request.test {
         LightMode::Test
     } else {
@@ -407,21 +621,7 @@ async fn set_mode(
         .flatten();
 
     if mode == LightMode::Test {
-        let (color_name, color) = state.test_mode.current_color();
-        let power = state.test_mode.power();
-
-        // Joining a mode means adopting its complete current desired state.
-        // This keeps every enrolled light synchronized immediately.
-        let transition_started = Instant::now();
-        if let Err(err) = sync_light_to_test_mode(
-            &state.client,
-            &light.device,
-            &state.config,
-            &state.test_mode,
-            power,
-        )
-        .await
-        {
+        if let Err(err) = start_test_mode_sync(&state, id, &light).await {
             if let Err(store_err) = state.controller.set_mode(id, previous).await {
                 error!(
                     lifx_id = %format!("{id:#018x}"),
@@ -435,39 +635,6 @@ async fn set_mode(
                 .await;
             return Err(ApiError::lifx(err));
         }
-
-        state.controller.set_desired_color(id, color).await;
-        state.controller.set_desired_power(id, Some(power)).await;
-        state
-            .controller
-            .begin_brightness_transition(
-                id,
-                color.brightness,
-                state.config.transition,
-                transition_started,
-            )
-            .await;
-
-        info!(
-            lifx_id = %format!("{id:#018x}"),
-            color = color_name,
-            brightness = color.brightness,
-            power = ?power,
-            transition_seconds = state.config.transition.as_secs(),
-            "started synchronization to current Test Mode state"
-        );
-
-        // The regular 10-second observation poll can catch a light halfway
-        // through a 5-second fade. Do a dedicated post-transition readback so
-        // the controller/UI receives the real final value instead of caching
-        // an intermediate brightness such as 80% or 89%.
-        tokio::spawn(confirm_test_mode_sync(
-            Arc::clone(&state.client),
-            state.controller.clone(),
-            Arc::clone(&state.config),
-            state.test_mode.clone(),
-            light.device.clone(),
-        ));
     }
 
     info!(
@@ -478,6 +645,87 @@ async fn set_mode(
     );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn start_test_mode_sync(
+    state: &WebState,
+    id: LifxId,
+    light: &ManagedLight,
+) -> Result<(), lifx::Error> {
+    let (color_name, color) = state.test_mode.current_color();
+    let power = state.test_mode.power();
+    let transition_started = Instant::now();
+
+    sync_light_to_test_mode(
+        &state.client,
+        &light.device,
+        &state.config,
+        &state.test_mode,
+        power,
+    )
+    .await?;
+
+    state.controller.set_desired_color(id, color).await;
+    state.controller.set_desired_power(id, Some(power)).await;
+    state
+        .controller
+        .begin_brightness_transition(
+            id,
+            color.brightness,
+            state.config.transition,
+            transition_started,
+        )
+        .await;
+
+    info!(
+        lifx_id = %format!("{id:#018x}"),
+        color = color_name,
+        brightness = color.brightness,
+        power = ?power,
+        transition_seconds = state.config.transition.as_secs(),
+        "started synchronization to current Test Mode state"
+    );
+
+    tokio::spawn(confirm_test_mode_sync(
+        Arc::clone(&state.client),
+        state.controller.clone(),
+        Arc::clone(&state.config),
+        state.test_mode.clone(),
+        light.device.clone(),
+    ));
+
+    Ok(())
+}
+
+fn require_control_enabled(light: &ManagedLight) -> Result<(), ApiError> {
+    if !light.control_enabled {
+        return Err(ApiError::conflict(
+            "SHOCS control is disabled for this light; re-enable it from Manage",
+        ));
+    }
+
+    Ok(())
+}
+
+fn normalize_friendly_name(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    // lifx-lan-rs intentionally mirrors the current NUL-terminated LifxString
+    // representation and therefore accepts 31 visible UTF-8 bytes.
+    if value.len() > 31 {
+        return Err(ApiError::bad_request(
+            "friendly name must be 31 UTF-8 bytes or fewer",
+        ));
+    }
+
+    Ok(Some(value.to_string()))
 }
 
 async fn confirm_observation(state: &WebState, id: LifxId, light: &ManagedLight) {
@@ -496,7 +744,12 @@ async fn confirm_observation(state: &WebState, id: LifxId, light: &ManagedLight)
 }
 
 fn sort_name(light: &ManagedLight) -> String {
-    light.label.as_deref().unwrap_or("").to_ascii_lowercase()
+    light
+        .friendly_name
+        .as_deref()
+        .or(light.label.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 fn to_light_view(light: ManagedLight, online_window: Duration) -> LightView {
@@ -546,6 +799,7 @@ fn to_light_view(light: ManagedLight, online_window: Duration) -> LightView {
             .unwrap_or_else(|| format!("LIFX {:#018x}", light.device.id)),
         address: light.device.addr.to_string(),
         online,
+        control_enabled: light.control_enabled,
         mode: light.mode.as_str(),
         power_on,
         brightness_percent,
@@ -603,6 +857,13 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
         }
     }

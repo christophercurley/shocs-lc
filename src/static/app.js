@@ -605,7 +605,9 @@ function updateCard(light, refreshStartedAt) {
   refs.badgeText.textContent = light.online ? "Online" : "Offline";
 
   const hasState = light.power_on !== null && light.brightness_percent !== null;
-  refs.powerInput.disabled = !hasState || refs.powerPending;
+  const controllable = hasState && light.control_enabled;
+  refs.card.classList.toggle("control-disabled", !light.control_enabled);
+  refs.powerInput.disabled = !controllable || refs.powerPending;
 
   // Ignore GET responses that were already in flight when the user clicked.
   // This prevents the classic OFF -> ON -> OFF visual bounce.
@@ -617,8 +619,8 @@ function updateCard(light, refreshStartedAt) {
     refs.powerInput.checked = light.power_on;
   }
 
-  refs.brightnessRow.classList.toggle("is-disabled", !hasState);
-  refs.slider.disabled = !hasState;
+  refs.brightnessRow.classList.toggle("is-disabled", !controllable);
+  refs.slider.disabled = !controllable;
 
   if (!hasState) {
     cancelBrightnessAnimation(refs);
@@ -644,8 +646,8 @@ function updateCard(light, refreshStartedAt) {
     light.saturation_percent !== null &&
     light.kelvin !== null;
 
-  refs.colorRow.classList.toggle("is-disabled", !hasColor);
-  refs.colorSwatchButton.disabled = !hasColor;
+  refs.colorRow.classList.toggle("is-disabled", !hasColor || !light.control_enabled);
+  refs.colorSwatchButton.disabled = !hasColor || !light.control_enabled;
 
   if (
     hasColor &&
@@ -659,6 +661,8 @@ function updateCard(light, refreshStartedAt) {
       light.kelvin,
     );
   }
+
+  refs.testInput.disabled = !light.control_enabled || refs.modePending;
 
   if (
     !refs.modePending &&

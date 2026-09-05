@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Lights · SHOCS</title>
+  <title>Manage Lights · SHOCS</title>
   <link rel="stylesheet" href="/static/styles.css">
-  <script src="/static/app.js" defer></script>
+  <script src="/static/manage.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -16,8 +16,8 @@
         <span>SHOCS</span>
       </a>
       <nav class="topnav" aria-label="Light Controller">
-        <a class="topnav-link is-active" href="/lights">Controls</a>
-        <a class="topnav-link" href="/manage">Manage</a>
+        <a class="topnav-link" href="/lights">Controls</a>
+        <a class="topnav-link is-active" href="/manage">Manage</a>
       </nav>
     </div>
   </header>
@@ -26,14 +26,14 @@
     <section class="page-heading">
       <div>
         <p class="eyebrow">LIGHT CONTROLLER</p>
-        <h1>Lights</h1>
-        <p>Live controls for every LIFX light currently known to SHOCS.</p>
+        <h1>Manage</h1>
+        <p>Durable SHOCS configuration for discovered and previously known lights.</p>
       </div>
-      <div class="refresh-status" id="refresh-status" aria-live="polite">Connecting…</div>
+      <div class="refresh-status" id="manage-status" aria-live="polite">Connecting…</div>
     </section>
 
-    <section class="light-grid" id="light-grid" aria-live="polite">
-      <div class="empty-card" id="loading-card">Loading discovered lights…</div>
+    <section class="management-grid" id="management-grid" aria-live="polite">
+      <div class="empty-card" id="manage-loading">Loading configured lights…</div>
     </section>
   </main>
 

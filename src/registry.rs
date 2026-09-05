@@ -93,7 +93,7 @@ pub struct ManagedLight {
     pub device: LifxDevice,
     pub label: Option<String>,
     pub friendly_name: Option<String>,
-    pub enabled: bool,
+    pub control_enabled: bool,
     pub mode: LightMode,
     pub observed: Option<LightState>,
 
@@ -234,6 +234,15 @@ impl ControllerState {
         self.lights.read().await.values().cloned().collect()
     }
 
+    pub async fn configured_lights(&self) -> Vec<StoredLight> {
+        self.persisted_lights
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub async fn light(&self, id: LifxId) -> Option<ManagedLight> {
         self.lights.read().await.get(&id).cloned()
     }
@@ -266,6 +275,78 @@ impl ControllerState {
         Ok(Some(previous))
     }
 
+    pub async fn set_friendly_name(
+        &self,
+        id: LifxId,
+        friendly_name: Option<String>,
+    ) -> Result<Option<String>, StoreError> {
+        let previous = self
+            .persisted_lights
+            .read()
+            .await
+            .get(&id)
+            .and_then(|light| light.friendly_name.clone());
+
+        self.store
+            .set_friendly_name(id, friendly_name.as_deref())
+            .await?;
+
+        if let Some(light) = self.persisted_lights.write().await.get_mut(&id) {
+            light.friendly_name = friendly_name.clone();
+        }
+        if let Some(light) = self.lights.write().await.get_mut(&id) {
+            light.friendly_name = friendly_name;
+        }
+
+        Ok(previous)
+    }
+
+    pub async fn set_control_enabled(
+        &self,
+        id: LifxId,
+        control_enabled: bool,
+    ) -> Result<Option<bool>, StoreError> {
+        let previous = self
+            .persisted_lights
+            .read()
+            .await
+            .get(&id)
+            .map(|light| light.control_enabled);
+
+        self.store.set_control_enabled(id, control_enabled).await?;
+
+        if let Some(light) = self.persisted_lights.write().await.get_mut(&id) {
+            light.control_enabled = control_enabled;
+        }
+        if let Some(light) = self.lights.write().await.get_mut(&id) {
+            light.control_enabled = control_enabled;
+            if !control_enabled {
+                light.power_override = None;
+            }
+        }
+
+        Ok(previous)
+    }
+
+    pub async fn record_device_label(
+        &self,
+        id: LifxId,
+        device_label: Option<String>,
+    ) -> Result<(), StoreError> {
+        self.store
+            .set_device_label(id, device_label.as_deref())
+            .await?;
+
+        if let Some(light) = self.persisted_lights.write().await.get_mut(&id) {
+            light.device_label = device_label.clone();
+        }
+        if let Some(light) = self.lights.write().await.get_mut(&id) {
+            light.label = device_label;
+        }
+
+        Ok(())
+    }
+
     pub async fn set_desired_power(
         &self,
         id: LifxId,
@@ -280,7 +361,10 @@ impl ControllerState {
 
     pub async fn set_desired_power_for_mode(&self, mode: LightMode, power: Power) {
         let mut lights = self.lights.write().await;
-        for light in lights.values_mut().filter(|light| light.mode == mode) {
+        for light in lights
+            .values_mut()
+            .filter(|light| light.mode == mode && light.control_enabled)
+        {
             light.desired_power = Some(power);
         }
     }
@@ -297,7 +381,10 @@ impl ControllerState {
         let mut lights = self.lights.write().await;
         let target = ColorTarget::from(color);
 
-        for light in lights.values_mut().filter(|light| light.mode == mode) {
+        for light in lights
+            .values_mut()
+            .filter(|light| light.mode == mode && light.control_enabled)
+        {
             light.desired_color = Some(target);
         }
     }
@@ -348,7 +435,10 @@ impl ControllerState {
     ) {
         let mut lights = self.lights.write().await;
 
-        for light in lights.values_mut().filter(|light| light.mode == mode) {
+        for light in lights
+            .values_mut()
+            .filter(|light| light.mode == mode && light.control_enabled)
+        {
             let from = light.transition_start_brightness(started).unwrap_or(target);
             light.desired_brightness = Some(target);
             light.brightness_transition = if duration.is_zero() || from == target {
@@ -388,7 +478,10 @@ impl ControllerState {
         let mut lights = self.lights.write().await;
         let mut cleared = 0usize;
 
-        for light in lights.values_mut().filter(|light| light.mode == mode) {
+        for light in lights
+            .values_mut()
+            .filter(|light| light.mode == mode && light.control_enabled)
+        {
             if light.power_override.take().is_some() {
                 cleared += 1;
             }
@@ -411,7 +504,7 @@ impl ControllerState {
             .read()
             .await
             .values()
-            .filter(|light| light.mode == mode)
+            .filter(|light| light.mode == mode && light.control_enabled)
             .map(|light| light.device.clone())
             .collect()
     }
@@ -428,7 +521,7 @@ impl ControllerState {
             .await
             .values()
             .filter_map(|light| {
-                if light.mode != mode {
+                if light.mode != mode || !light.control_enabled {
                     return None;
                 }
 
@@ -474,31 +567,31 @@ pub async fn refresh_registry(client: &LifxClient, state: &ControllerState) -> l
     let discovered = client.discover().await?;
 
     for device in discovered.values() {
-        let existing = {
-            let lights = state.lights.read().await;
-            lights.get(&device.id).cloned()
+        // PH3-A1 intentionally reconciles labels on the normal discovery
+        // cadence. This keeps out-of-band LIFX-app renames observable and lets
+        // SHOCS re-assert a configured friendly name after a bulb reconnects.
+        // We can split metadata onto a slower cadence later if scale warrants it.
+        let mut physical_label = match client.get_label(device).await {
+            Ok(label) => Some(label),
+            Err(err) => {
+                warn!(
+                    lifx_id = %format!("{:#018x}", device.id),
+                    address = %device.addr,
+                    error = %err,
+                    "could not read LIFX label"
+                );
+
+                state
+                    .lights
+                    .read()
+                    .await
+                    .get(&device.id)
+                    .and_then(|light| light.label.clone())
+            }
         };
 
-        // Labels are relatively static metadata. Fetch them for new devices,
-        // and retry later if an earlier lookup failed.
-        let label = match existing.as_ref().and_then(|light| light.label.clone()) {
-            Some(label) => Some(label),
-            None => match client.get_label(device).await {
-                Ok(label) => Some(label),
-                Err(err) => {
-                    warn!(
-                        lifx_id = %format!("{:#018x}", device.id),
-                        address = %device.addr,
-                        error = %err,
-                        "could not read LIFX label"
-                    );
-                    None
-                }
-            },
-        };
-
-        let stored = match state
-            .ensure_persisted_light(device.id, label.as_deref())
+        let mut stored = match state
+            .ensure_persisted_light(device.id, physical_label.as_deref())
             .await
         {
             Ok(stored) => stored,
@@ -512,7 +605,46 @@ pub async fn refresh_registry(client: &LifxClient, state: &ControllerState) -> l
             }
         };
 
-        let label = label.or_else(|| stored.device_label.clone());
+        // A SHOCS friendly name is durable desired metadata. When control is
+        // enabled, mirror it back to the bulb so other LIFX clients see the same
+        // name. If the bulb is temporarily unreachable, discovery retries later.
+        if stored.control_enabled {
+            if let Some(friendly_name) = stored.friendly_name.as_deref() {
+                if physical_label.as_deref() != Some(friendly_name) {
+                    match client.set_label(device, friendly_name).await {
+                        Ok(confirmed) => {
+                            info!(
+                                lifx_id = %format!("{:#018x}", device.id),
+                                label = %confirmed,
+                                "reconciled physical LIFX label to SHOCS friendly name"
+                            );
+                            physical_label = Some(confirmed.clone());
+
+                            if let Err(err) = state
+                                .record_device_label(device.id, Some(confirmed.clone()))
+                                .await
+                            {
+                                warn!(
+                                    lifx_id = %format!("{:#018x}", device.id),
+                                    error = %err,
+                                    "physical label changed but database refresh failed"
+                                );
+                            } else {
+                                stored.device_label = Some(confirmed);
+                            }
+                        }
+                        Err(err) => warn!(
+                            lifx_id = %format!("{:#018x}", device.id),
+                            desired_label = %friendly_name,
+                            error = %err,
+                            "could not mirror SHOCS friendly name to physical LIFX device"
+                        ),
+                    }
+                }
+            }
+        }
+
+        let label = physical_label.or_else(|| stored.device_label.clone());
         let now = Instant::now();
         let mut lights = state.lights.write().await;
 
@@ -529,6 +661,7 @@ pub async fn refresh_registry(client: &LifxClient, state: &ControllerState) -> l
                     lifx_id = %format!("{:#018x}", device.id),
                     address = %device.addr,
                     label = %label_for_log,
+                    control_enabled = stored.control_enabled,
                     mode = ?mode,
                     "discovered new LIFX device"
                 );
@@ -537,7 +670,7 @@ pub async fn refresh_registry(client: &LifxClient, state: &ControllerState) -> l
                     device: device.clone(),
                     label,
                     friendly_name: stored.friendly_name,
-                    enabled: stored.enabled,
+                    control_enabled: stored.control_enabled,
                     mode,
                     observed: None,
                     desired_power: None,
@@ -563,13 +696,9 @@ pub async fn refresh_registry(client: &LifxClient, state: &ControllerState) -> l
 
                 light.device = device.clone();
                 light.last_discovered = now;
-
-                if light.label.is_none() {
-                    light.label = label;
-                }
-
+                light.label = label;
                 light.friendly_name = stored.friendly_name;
-                light.enabled = stored.enabled;
+                light.control_enabled = stored.control_enabled;
                 light.mode = stored.mode;
             }
         }

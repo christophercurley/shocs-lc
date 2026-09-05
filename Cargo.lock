@@ -819,7 +819,7 @@ dependencies = [
 [[package]]
 name = "lifx"
 version = "0.3.1"
-source = "git+https://github.com/christophercurley/lifx-lan-rs#74b57ed9715f0ba18f3c14ad1adf25eafdc7f025"
+source = "git+https://github.com/christophercurley/lifx-lan-rs#1881e8fe535b4ae6c5e8dd117610a2891450cd32"
 dependencies = [
  "lifx-core",
  "tokio",
@@ -828,7 +828,7 @@ dependencies = [
 [[package]]
 name = "lifx-core"
 version = "0.4.0"
-source = "git+https://github.com/christophercurley/lifx-lan-rs#74b57ed9715f0ba18f3c14ad1adf25eafdc7f025"
+source = "git+https://github.com/christophercurley/lifx-lan-rs#1881e8fe535b4ae6c5e8dd117610a2891450cd32"
 dependencies = [
  "byteorder",
  "thiserror 1.0.69",

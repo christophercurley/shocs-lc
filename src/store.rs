@@ -15,7 +15,7 @@ pub struct StoredLight {
     pub id: LifxId,
     pub device_label: Option<String>,
     pub friendly_name: Option<String>,
-    pub enabled: bool,
+    pub control_enabled: bool,
     pub mode: LightMode,
 }
 
@@ -89,7 +89,7 @@ impl PostgresStore {
     pub async fn load_lights(&self) -> Result<Vec<StoredLight>, StoreError> {
         let rows = sqlx::query(
             r#"
-            SELECT lifx_id, device_label, friendly_name, enabled, mode
+            SELECT lifx_id, device_label, friendly_name, control_enabled, mode
             FROM lights
             ORDER BY lifx_id
             "#,
@@ -109,8 +109,8 @@ impl PostgresStore {
     }
 
     /// Ensure a discovered physical light has durable configuration.
-    /// Existing mode/name configuration wins; discovery only refreshes the
-    /// relatively-static LIFX device label.
+    /// Existing mode/name configuration wins; discovery refreshes only the
+    /// observed LIFX device label.
     pub async fn upsert_discovered_light(
         &self,
         id: LifxId,
@@ -130,7 +130,7 @@ impl PostgresStore {
                     THEN now()
                     ELSE lights.updated_at
                 END
-            RETURNING lifx_id, device_label, friendly_name, enabled, mode
+            RETURNING lifx_id, device_label, friendly_name, control_enabled, mode
             "#,
         )
         .bind(lifx_id)
@@ -155,12 +155,76 @@ impl PostgresStore {
         .execute(&self.pool)
         .await?;
 
-        if result.rows_affected() != 1 {
-            return Err(StoreError::UnknownLight(id));
-        }
-
-        Ok(())
+        require_one_row(id, result.rows_affected())
     }
+
+    pub async fn set_friendly_name(
+        &self,
+        id: LifxId,
+        friendly_name: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE lights
+            SET friendly_name = $2, updated_at = now()
+            WHERE lifx_id = $1
+            "#,
+        )
+        .bind(format_lifx_id(id))
+        .bind(friendly_name)
+        .execute(&self.pool)
+        .await?;
+
+        require_one_row(id, result.rows_affected())
+    }
+
+    pub async fn set_control_enabled(
+        &self,
+        id: LifxId,
+        control_enabled: bool,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE lights
+            SET control_enabled = $2, updated_at = now()
+            WHERE lifx_id = $1
+            "#,
+        )
+        .bind(format_lifx_id(id))
+        .bind(control_enabled)
+        .execute(&self.pool)
+        .await?;
+
+        require_one_row(id, result.rows_affected())
+    }
+
+    pub async fn set_device_label(
+        &self,
+        id: LifxId,
+        device_label: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE lights
+            SET device_label = $2, updated_at = now()
+            WHERE lifx_id = $1
+            "#,
+        )
+        .bind(format_lifx_id(id))
+        .bind(device_label)
+        .execute(&self.pool)
+        .await?;
+
+        require_one_row(id, result.rows_affected())
+    }
+}
+
+fn require_one_row(id: LifxId, rows_affected: u64) -> Result<(), StoreError> {
+    if rows_affected != 1 {
+        return Err(StoreError::UnknownLight(id));
+    }
+
+    Ok(())
 }
 
 fn decode_light(row: sqlx::postgres::PgRow) -> Result<StoredLight, StoreError> {
@@ -175,7 +239,7 @@ fn decode_light(row: sqlx::postgres::PgRow) -> Result<StoredLight, StoreError> {
         id,
         device_label: row.try_get("device_label")?,
         friendly_name: row.try_get("friendly_name")?,
-        enabled: row.try_get("enabled")?,
+        control_enabled: row.try_get("control_enabled")?,
         mode,
     })
 }
