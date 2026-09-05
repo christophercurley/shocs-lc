@@ -16,11 +16,12 @@ const DEFAULT_TIMEZONE: &str = "America/New_York";
 const DEFAULT_OFF_TIME: &str = "02:00";
 const DEFAULT_ON_TIME: &str = "10:00";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub lifx_broadcast_addr: SocketAddr,
     pub http_bind_addr: SocketAddr,
+    pub database_url: String,
     pub initial_test_ids: Vec<LifxId>,
     pub discovery_interval: Duration,
     pub state_poll_interval: Duration,
@@ -47,6 +48,7 @@ impl Config {
         let bind_addr = required_socket_addr("SHOCS_LC_BIND")?;
         let lifx_broadcast_addr = required_socket_addr("SHOCS_LC_LIFX_BROADCAST")?;
         let http_bind_addr = required_socket_addr("SHOCS_LC_HTTP_BIND")?;
+        let database_url = required_string("DATABASE_URL")?;
 
         // Keep the existing environment-variable name for compatibility. Its
         // meaning is now "lights that start in Test Mode" rather than a global
@@ -105,6 +107,7 @@ impl Config {
             bind_addr,
             lifx_broadcast_addr,
             http_bind_addr,
+            database_url,
             initial_test_ids,
             discovery_interval,
             state_poll_interval,
@@ -115,6 +118,17 @@ impl Config {
             on_time,
         })
     }
+}
+
+fn required_string(name: &str) -> Result<String, ConfigError> {
+    let value = env::var(name)
+        .map_err(|_| ConfigError(format!("required environment variable {name} is not set")))?;
+
+    if value.trim().is_empty() {
+        return Err(ConfigError(format!("{name} must not be empty")));
+    }
+
+    Ok(value)
 }
 
 fn required_socket_addr(name: &str) -> Result<SocketAddr, ConfigError> {

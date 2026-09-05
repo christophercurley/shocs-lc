@@ -2,6 +2,7 @@ mod config;
 mod logging;
 mod registry;
 mod schedule;
+mod store;
 mod tasks;
 mod test_mode;
 mod web;
@@ -16,6 +17,7 @@ use tracing::{error, info, warn};
 use config::Config;
 use registry::{ControllerState, refresh_registry};
 use schedule::desired_power_now;
+use store::PostgresStore;
 use tasks::{
     apply_test_power, color_task, discovery_task, poll_light_states, power_schedule_task,
     state_poll_task, test_reconcile_task,
@@ -53,12 +55,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         timezone = %config.timezone,
         "Test Mode configured"
     );
-    info!(ids = %initial_test_ids, "lights configured to start in Test Mode");
+    info!(
+        ids = %initial_test_ids,
+        "bootstrap Test Mode IDs configured; persisted database modes take precedence"
+    );
+
+    let store = Arc::new(PostgresStore::connect(&config.database_url).await?);
+    let persisted_lights = store.load_lights().await?;
+    let persisted_groups = store.group_count().await?;
+    info!(
+        lights = persisted_lights.len(),
+        groups = persisted_groups,
+        "PostgreSQL configuration loaded and migrations are current"
+    );
 
     let client =
         Arc::new(LifxClient::bind(config.bind_addr, config.lifx_broadcast_addr, SOURCE_ID).await?);
 
-    let state = ControllerState::new(&config.initial_test_ids);
+    let state = ControllerState::new(
+        &config.initial_test_ids,
+        persisted_lights,
+        Arc::clone(&store),
+    );
 
     match refresh_registry(&client, &state).await {
         Ok(count) => info!(devices = count, "initial LIFX discovery finished"),
@@ -115,9 +133,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         test_mode,
     });
 
-    warn!(
+    info!(
         http_bind = %config.http_bind_addr,
-        "PH1 debug web UI is unauthenticated; keep it LAN-only and do not expose it to the Internet"
+        "internal Axum service is listening on loopback behind the SHOCS gateway"
     );
 
     let web_handle = tokio::spawn(async move {

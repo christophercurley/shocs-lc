@@ -9,10 +9,11 @@ use axum::{Json, Router};
 use lifx::{Color, LifxClient, LifxId, Power};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
-use tracing::{info, trace};
+use tracing::{error, info, trace};
 
 use crate::config::Config;
 use crate::registry::{ControllerState, LightMode, ManagedLight};
+use crate::store::StoreError;
 use crate::tasks::{confirm_test_mode_sync, sync_light_to_test_mode};
 use crate::test_mode::TestModeState;
 
@@ -191,7 +192,11 @@ async fn set_brightness(
         .await
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
 
-    let previous_mode = state.controller.set_mode(id, LightMode::Custom).await;
+    let previous_mode = state
+        .controller
+        .set_mode(id, LightMode::Custom)
+        .await
+        .map_err(ApiError::store)?;
 
     if previous_mode == Some(LightMode::Test) {
         let _ = state.controller.set_power_override(id, None).await;
@@ -288,7 +293,11 @@ async fn set_color(
         .await
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
 
-    let previous_mode = state.controller.set_mode(id, LightMode::Custom).await;
+    let previous_mode = state
+        .controller
+        .set_mode(id, LightMode::Custom)
+        .await
+        .map_err(ApiError::store)?;
 
     if previous_mode == Some(LightMode::Test) {
         let _ = state.controller.set_power_override(id, None).await;
@@ -385,6 +394,7 @@ async fn set_mode(
         .controller
         .set_mode(id, mode)
         .await
+        .map_err(ApiError::store)?
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
 
     // Changing modes starts with a clean mode-owned power state. Manual Test
@@ -412,7 +422,13 @@ async fn set_mode(
         )
         .await
         {
-            let _ = state.controller.set_mode(id, previous).await;
+            if let Err(store_err) = state.controller.set_mode(id, previous).await {
+                error!(
+                    lifx_id = %format!("{id:#018x}"),
+                    error = %store_err,
+                    "failed to roll back persisted light mode after Test Mode sync failure"
+                );
+            }
             let _ = state
                 .controller
                 .set_power_override(id, previous_override)
@@ -525,7 +541,8 @@ fn to_light_view(light: ManagedLight, online_window: Duration) -> LightView {
     LightView {
         id: format!("{:#018x}", light.device.id),
         label: light
-            .label
+            .friendly_name
+            .or(light.label)
             .unwrap_or_else(|| format!("LIFX {:#018x}", light.device.id)),
         address: light.device.addr.to_string(),
         online,
@@ -594,6 +611,14 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_GATEWAY,
             message: format!("LIFX command failed: {err}"),
+        }
+    }
+
+    fn store(err: StoreError) -> Self {
+        error!(error = %err, "persistent light configuration update failed");
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "persistent configuration is temporarily unavailable".to_string(),
         }
     }
 }

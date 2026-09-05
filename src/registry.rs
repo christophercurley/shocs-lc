@@ -7,6 +7,8 @@ use lifx::{Color, LifxClient, LifxDevice, LifxId, LightState, Power};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::store::{PostgresStore, StoreError, StoredLight};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightMode {
     Test,
@@ -18,6 +20,14 @@ impl LightMode {
         match self {
             Self::Test => "test",
             Self::Custom => "custom",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "test" => Some(Self::Test),
+            "custom" => Some(Self::Custom),
+            _ => None,
         }
     }
 }
@@ -82,6 +92,8 @@ impl BrightnessTransition {
 pub struct ManagedLight {
     pub device: LifxDevice,
     pub label: Option<String>,
+    pub friendly_name: Option<String>,
+    pub enabled: bool,
     pub mode: LightMode,
     pub observed: Option<LightState>,
 
@@ -149,23 +161,73 @@ impl ManagedLight {
 #[derive(Clone)]
 pub struct ControllerState {
     lights: Arc<RwLock<HashMap<LifxId, ManagedLight>>>,
+    persisted_lights: Arc<RwLock<HashMap<LifxId, StoredLight>>>,
     initial_test_ids: Arc<HashSet<LifxId>>,
+    store: Arc<PostgresStore>,
 }
 
 impl ControllerState {
-    pub fn new(initial_test_ids: &[LifxId]) -> Self {
+    pub fn new(
+        initial_test_ids: &[LifxId],
+        persisted_lights: Vec<StoredLight>,
+        store: Arc<PostgresStore>,
+    ) -> Self {
+        let persisted_lights = persisted_lights
+            .into_iter()
+            .map(|light| (light.id, light))
+            .collect();
+
         Self {
             lights: Arc::new(RwLock::new(HashMap::new())),
+            persisted_lights: Arc::new(RwLock::new(persisted_lights)),
             initial_test_ids: Arc::new(initial_test_ids.iter().copied().collect()),
+            store,
         }
     }
 
-    fn initial_mode(&self, id: LifxId) -> LightMode {
+    fn bootstrap_mode(&self, id: LifxId) -> LightMode {
         if self.initial_test_ids.contains(&id) {
             LightMode::Test
         } else {
             LightMode::Custom
         }
+    }
+
+    async fn ensure_persisted_light(
+        &self,
+        id: LifxId,
+        device_label: Option<&str>,
+    ) -> Result<StoredLight, StoreError> {
+        let existing = self.persisted_lights.read().await.get(&id).cloned();
+
+        if let Some(existing) = existing {
+            let label_changed =
+                device_label.is_some() && existing.device_label.as_deref() != device_label;
+
+            if !label_changed {
+                return Ok(existing);
+            }
+
+            let refreshed = self
+                .store
+                .upsert_discovered_light(id, device_label, existing.mode)
+                .await?;
+            self.persisted_lights
+                .write()
+                .await
+                .insert(id, refreshed.clone());
+            return Ok(refreshed);
+        }
+
+        let stored = self
+            .store
+            .upsert_discovered_light(id, device_label, self.bootstrap_mode(id))
+            .await?;
+        self.persisted_lights
+            .write()
+            .await
+            .insert(id, stored.clone());
+        Ok(stored)
     }
 
     pub async fn lights(&self) -> Vec<ManagedLight> {
@@ -176,12 +238,32 @@ impl ControllerState {
         self.lights.read().await.get(&id).cloned()
     }
 
-    pub async fn set_mode(&self, id: LifxId, mode: LightMode) -> Option<LightMode> {
-        let mut lights = self.lights.write().await;
-        let light = lights.get_mut(&id)?;
-        let previous = light.mode;
-        light.mode = mode;
-        Some(previous)
+    pub async fn set_mode(
+        &self,
+        id: LifxId,
+        mode: LightMode,
+    ) -> Result<Option<LightMode>, StoreError> {
+        let previous = self.lights.read().await.get(&id).map(|light| light.mode);
+        let Some(previous) = previous else {
+            return Ok(None);
+        };
+
+        if previous == mode {
+            return Ok(Some(previous));
+        }
+
+        // Persist first. If PostgreSQL is temporarily unavailable, the web/API
+        // operation fails cleanly and in-memory configuration remains unchanged.
+        self.store.set_light_mode(id, mode).await?;
+
+        if let Some(light) = self.lights.write().await.get_mut(&id) {
+            light.mode = mode;
+        }
+        if let Some(light) = self.persisted_lights.write().await.get_mut(&id) {
+            light.mode = mode;
+        }
+
+        Ok(Some(previous))
     }
 
     pub async fn set_desired_power(
@@ -415,13 +497,33 @@ pub async fn refresh_registry(client: &LifxClient, state: &ControllerState) -> l
             },
         };
 
+        let stored = match state
+            .ensure_persisted_light(device.id, label.as_deref())
+            .await
+        {
+            Ok(stored) => stored,
+            Err(err) => {
+                warn!(
+                    lifx_id = %format!("{:#018x}", device.id),
+                    error = %err,
+                    "could not persist discovered LIFX device; will retry on a later discovery"
+                );
+                continue;
+            }
+        };
+
+        let label = label.or_else(|| stored.device_label.clone());
         let now = Instant::now();
         let mut lights = state.lights.write().await;
 
         match lights.entry(device.id) {
             Entry::Vacant(entry) => {
-                let mode = state.initial_mode(device.id);
-                let label_for_log = label.as_deref().unwrap_or("<unknown>");
+                let mode = stored.mode;
+                let label_for_log = stored
+                    .friendly_name
+                    .as_deref()
+                    .or(label.as_deref())
+                    .unwrap_or("<unknown>");
 
                 info!(
                     lifx_id = %format!("{:#018x}", device.id),
@@ -434,6 +536,8 @@ pub async fn refresh_registry(client: &LifxClient, state: &ControllerState) -> l
                 entry.insert(ManagedLight {
                     device: device.clone(),
                     label,
+                    friendly_name: stored.friendly_name,
+                    enabled: stored.enabled,
                     mode,
                     observed: None,
                     desired_power: None,
@@ -463,6 +567,10 @@ pub async fn refresh_registry(client: &LifxClient, state: &ControllerState) -> l
                 if light.label.is_none() {
                     light.label = label;
                 }
+
+                light.friendly_name = stored.friendly_name;
+                light.enabled = stored.enabled;
+                light.mode = stored.mode;
             }
         }
     }
