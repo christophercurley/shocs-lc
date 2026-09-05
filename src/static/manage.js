@@ -2,6 +2,31 @@ const grid = document.querySelector("#management-grid");
 const status = document.querySelector("#manage-status");
 const toast = document.querySelector("#toast");
 let toastTimer;
+let managedLights = [];
+
+function normalizeFriendlyName(value) {
+  return value.trim();
+}
+
+function friendlyNameKey(value) {
+  return normalizeFriendlyName(value).toLocaleLowerCase();
+}
+
+function utf8Length(value) {
+  return new TextEncoder().encode(value).length;
+}
+
+function duplicateFriendlyName(lightId, candidate) {
+  if (!candidate) return null;
+
+  const key = friendlyNameKey(candidate);
+  return managedLights.find(
+    (light) =>
+      light.id !== lightId &&
+      light.friendly_name &&
+      friendlyNameKey(light.friendly_name) === key,
+  ) ?? null;
+}
 
 function showToast(message, isError = false) {
   clearTimeout(toastTimer);
@@ -82,7 +107,7 @@ function createManagementCard(light) {
   nameLabel.textContent = "Friendly name";
   const nameHelp = document.createElement("span");
   nameHelp.className = "field-help";
-  nameHelp.textContent = "Stored by SHOCS and mirrored to the physical LIFX label.";
+  nameHelp.textContent = "Unique SHOCS name; trimmed and mirrored to the physical LIFX label.";
   const nameInput = document.createElement("input");
   nameInput.className = "text-input";
   nameInput.type = "text";
@@ -152,7 +177,27 @@ function createManagementCard(light) {
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     save.disabled = true;
-    const trimmed = nameInput.value.trim();
+    const trimmed = normalizeFriendlyName(nameInput.value);
+    nameInput.value = trimmed;
+
+    if (/[\u0000-\u001F\u007F]/u.test(trimmed)) {
+      save.disabled = false;
+      showToast("Friendly name cannot contain control characters.", true);
+      return;
+    }
+
+    if (utf8Length(trimmed) > 31) {
+      save.disabled = false;
+      showToast("Friendly name must be 31 UTF-8 bytes or fewer.", true);
+      return;
+    }
+
+    const duplicate = duplicateFriendlyName(light.id, trimmed);
+    if (duplicate) {
+      save.disabled = false;
+      showToast(`A light named "${duplicate.friendly_name}" already exists.`, true);
+      return;
+    }
 
     try {
       const response = await api(`/api/manage/lights/${encodeURIComponent(light.id)}`, {
@@ -189,6 +234,7 @@ async function refreshManagement() {
     if (!response.ok) throw new Error(`Could not load management data (${response.status})`);
 
     const lights = await response.json();
+    managedLights = lights;
     grid.replaceChildren();
 
     if (lights.length === 0) {

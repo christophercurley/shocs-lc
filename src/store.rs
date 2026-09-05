@@ -26,6 +26,8 @@ pub enum StoreError {
     InvalidLifxId(String),
     InvalidMode(String),
     UnknownLight(LifxId),
+    FriendlyNameConflict(String),
+    InvalidFriendlyName(String),
 }
 
 impl fmt::Display for StoreError {
@@ -36,6 +38,12 @@ impl fmt::Display for StoreError {
             Self::InvalidLifxId(value) => write!(f, "invalid persisted LIFX ID '{value}'"),
             Self::InvalidMode(value) => write!(f, "invalid persisted light mode '{value}'"),
             Self::UnknownLight(id) => write!(f, "unknown persisted light {id:#018x}"),
+            Self::FriendlyNameConflict(name) => {
+                write!(f, "friendly name '{name}' is already in use")
+            }
+            Self::InvalidFriendlyName(name) => {
+                write!(f, "friendly name '{name}' violates database constraints")
+            }
         }
     }
 }
@@ -45,7 +53,11 @@ impl Error for StoreError {
         match self {
             Self::Sqlx(err) => Some(err),
             Self::Migrate(err) => Some(err),
-            Self::InvalidLifxId(_) | Self::InvalidMode(_) | Self::UnknownLight(_) => None,
+            Self::InvalidLifxId(_)
+            | Self::InvalidMode(_)
+            | Self::UnknownLight(_)
+            | Self::FriendlyNameConflict(_)
+            | Self::InvalidFriendlyName(_) => None,
         }
     }
 }
@@ -173,7 +185,8 @@ impl PostgresStore {
         .bind(format_lifx_id(id))
         .bind(friendly_name)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|err| map_friendly_name_error(err, friendly_name))?;
 
         require_one_row(id, result.rows_affected())
     }
@@ -217,6 +230,28 @@ impl PostgresStore {
 
         require_one_row(id, result.rows_affected())
     }
+}
+
+fn map_friendly_name_error(err: sqlx::Error, friendly_name: Option<&str>) -> StoreError {
+    if let sqlx::Error::Database(database_error) = &err {
+        match database_error.code().as_deref() {
+            // unique_violation
+            Some("23505") => {
+                return StoreError::FriendlyNameConflict(
+                    friendly_name.unwrap_or_default().to_string(),
+                );
+            }
+            // check_violation
+            Some("23514") => {
+                return StoreError::InvalidFriendlyName(
+                    friendly_name.unwrap_or_default().to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    StoreError::Sqlx(err)
 }
 
 fn require_one_row(id: LifxId, rows_affected: u64) -> Result<(), StoreError> {

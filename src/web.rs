@@ -717,6 +717,12 @@ fn normalize_friendly_name(value: Option<String>) -> Result<Option<String>, ApiE
         return Ok(None);
     }
 
+    if value.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "friendly name cannot contain control characters",
+        ));
+    }
+
     // lifx-lan-rs intentionally mirrors the current NUL-terminated LifxString
     // representation and therefore accepts 31 visible UTF-8 bytes.
     if value.len() > 31 {
@@ -876,10 +882,20 @@ impl ApiError {
     }
 
     fn store(err: StoreError) -> Self {
-        error!(error = %err, "persistent light configuration update failed");
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "persistent configuration is temporarily unavailable".to_string(),
+        match err {
+            StoreError::FriendlyNameConflict(name) => Self::conflict(format!(
+                "A light named '{name}' already exists. Friendly names must be unique."
+            )),
+            StoreError::InvalidFriendlyName(_) => Self::bad_request(
+                "friendly name is invalid; trim whitespace and use 31 UTF-8 bytes or fewer",
+            ),
+            other => {
+                error!(error = %other, "persistent light configuration update failed");
+                Self {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: "persistent configuration is temporarily unavailable".to_string(),
+                }
+            }
         }
     }
 }
