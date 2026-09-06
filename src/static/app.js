@@ -698,7 +698,7 @@ async function refreshLights() {
       const empty = document.createElement("div");
       empty.className = "empty-card";
       empty.id = "no-lights";
-      empty.textContent = "No LIFX lights discovered yet.";
+      empty.textContent = "No LIFX lights configured yet.";
       grid.append(empty);
     } else if (lights.length > 0) {
       document.querySelector("#no-lights")?.remove();

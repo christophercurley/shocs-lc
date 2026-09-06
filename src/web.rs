@@ -13,7 +13,7 @@ use tracing::{error, info, trace, warn};
 
 use crate::config::Config;
 use crate::registry::{ControllerState, LightMode, ManagedLight};
-use crate::store::StoreError;
+use crate::store::{StoreError, StoredLight};
 use crate::tasks::{confirm_test_mode_sync, sync_light_to_test_mode};
 use crate::test_mode::TestModeState;
 
@@ -47,6 +47,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/groups/{id}/power", put(set_group_power))
         .route("/api/groups/{id}/brightness", put(set_group_brightness))
         .route("/api/groups/{id}/color", put(set_group_color))
+        .route("/api/groups/{id}/mode", put(set_group_mode))
         .route("/api/lights/{id}/power", put(set_power))
         .route("/api/lights/{id}/brightness", put(set_brightness))
         .route("/api/lights/{id}/color", put(set_color))
@@ -121,15 +122,41 @@ struct BrightnessTransitionView {
 }
 
 async fn list_lights(State(state): State<WebState>) -> Json<Vec<LightView>> {
-    let mut lights = state.controller.lights().await;
-    lights.sort_by_key(sort_name);
-
     let online_window = state.config.state_poll_interval.saturating_mul(3);
-    let views = lights
-        .into_iter()
-        .map(|light| to_light_view(light, online_window))
-        .collect();
 
+    let mut runtime = state
+        .controller
+        .lights()
+        .await
+        .into_iter()
+        .map(|light| (light.device.id, light))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    // PostgreSQL is the durable inventory. A persisted light remains visible
+    // when it is unplugged or LC restarts while it is offline; discovery only
+    // supplies the optional runtime/network half of the card.
+    let configured = state.controller.configured_lights().await;
+    let mut views = configured
+        .into_iter()
+        .map(|stored| {
+            if let Some(light) = runtime.remove(&stored.id) {
+                to_light_view(light, online_window)
+            } else {
+                to_offline_light_view(stored)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // This should normally be empty because runtime insertion happens only
+    // after persistence succeeds, but retaining it makes the API robust during
+    // an unusual partial persistence/recovery situation.
+    views.extend(
+        runtime
+            .into_values()
+            .map(|light| to_light_view(light, online_window)),
+    );
+
+    views.sort_by_key(|light| light.label.to_ascii_lowercase());
     Json(views)
 }
 
@@ -339,6 +366,8 @@ struct GroupView {
     member_count: usize,
     control_enabled_count: usize,
     online_count: usize,
+    online_control_enabled_count: usize,
+    mode_state: Option<&'static str>,
     power_state: Option<&'static str>,
     brightness_percent: Option<u8>,
     hue_degrees: Option<u16>,
@@ -379,6 +408,12 @@ async fn list_groups(State(state): State<WebState>) -> Json<GroupsView> {
         .collect::<std::collections::HashMap<_, _>>();
 
     let configured = state.controller.configured_lights().await;
+    let configured_by_id = configured
+        .iter()
+        .cloned()
+        .map(|light| (light.id, light))
+        .collect::<std::collections::HashMap<_, _>>();
+
     let mut light_options = configured
         .iter()
         .map(|light| {
@@ -426,6 +461,34 @@ async fn list_groups(State(state): State<WebState>) -> Json<GroupsView> {
                         .is_some_and(|seen| seen.elapsed() <= online_window)
                 })
                 .count();
+
+            let configured_members = group
+                .member_ids
+                .iter()
+                .filter_map(|id| configured_by_id.get(id))
+                .collect::<Vec<_>>();
+
+            let control_enabled_count = configured_members
+                .iter()
+                .filter(|light| light.control_enabled)
+                .count();
+
+            let online_control_enabled_count = controllable
+                .iter()
+                .filter(|light| {
+                    light
+                        .last_observed
+                        .is_some_and(|seen| seen.elapsed() <= online_window)
+                })
+                .count();
+
+            let mut modes = configured_members.iter().map(|light| light.mode);
+            let first_mode = modes.next();
+            let mode_state = match first_mode {
+                Some(first) if modes.all(|mode| mode == first) => Some(first.as_str()),
+                Some(_) => Some("mixed"),
+                None => None,
+            };
 
             let mut power_values = controllable.iter().filter_map(|light| {
                 light
@@ -485,8 +548,10 @@ async fn list_groups(State(state): State<WebState>) -> Json<GroupsView> {
                     .map(|id| format!("{id:#018x}"))
                     .collect(),
                 member_count,
-                control_enabled_count: controllable.len(),
+                control_enabled_count,
                 online_count,
+                online_control_enabled_count,
+                mode_state,
                 power_state,
                 brightness_percent,
                 hue_degrees: hue.map(u16_to_hue_degrees),
@@ -815,6 +880,105 @@ async fn set_group_color(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Serialize)]
+struct GroupModeResult {
+    mode: &'static str,
+    members: usize,
+    synced_now: usize,
+    pending_sync: usize,
+}
+
+async fn set_group_mode(
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+    Json(request): Json<ModeRequest>,
+) -> Result<Json<GroupModeResult>, ApiError> {
+    let group = state
+        .controller
+        .group(id)
+        .await
+        .ok_or_else(|| ApiError::not_found("unknown light group"))?;
+
+    if group.member_ids.is_empty() {
+        return Err(ApiError::conflict("group has no members"));
+    }
+
+    let mode = if request.test {
+        LightMode::Test
+    } else {
+        LightMode::Custom
+    };
+
+    let updated_ids = state
+        .controller
+        .set_group_mode(id, mode)
+        .await
+        .map_err(ApiError::store)?;
+
+    let runtime = state
+        .controller
+        .lights_in_group(id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|light| (light.device.id, light))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut synced_now = 0usize;
+    let mut pending_sync = 0usize;
+
+    for light_id in &updated_ids {
+        let Some(light) = runtime.get(light_id) else {
+            // Mode is already durable. This light will pick it up whenever it
+            // is discovered again.
+            pending_sync += 1;
+            continue;
+        };
+
+        if !light.control_enabled {
+            pending_sync += 1;
+            continue;
+        }
+
+        let _ = state.controller.set_power_override(*light_id, None).await;
+
+        if mode == LightMode::Test {
+            match start_test_mode_sync(&state, *light_id, light).await {
+                Ok(()) => synced_now += 1,
+                Err(err) => {
+                    pending_sync += 1;
+                    warn!(
+                        group_id = id,
+                        lifx_id = %format!("{light_id:#018x}"),
+                        error = %err,
+                        "group Test Mode enrollment persisted; physical sync will retry later"
+                    );
+                }
+            }
+        } else {
+            // Custom has no mode-owned physical state to push immediately.
+            synced_now += 1;
+        }
+    }
+
+    info!(
+        group_id = id,
+        group_name = %group.name,
+        members = updated_ids.len(),
+        mode = mode.as_str(),
+        synced_now,
+        pending_sync,
+        "light group mode changed"
+    );
+
+    Ok(Json(GroupModeResult {
+        mode: mode.as_str(),
+        members: updated_ids.len(),
+        synced_now,
+        pending_sync,
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 struct PowerRequest {
     on: bool,
@@ -1100,13 +1264,17 @@ async fn set_mode(
     Json(request): Json<ModeRequest>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_lifx_id(&id)?;
-    let light = state
+    let configured = state
         .controller
-        .light(id)
+        .configured_light(id)
         .await
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
 
-    require_control_enabled(&light)?;
+    if !configured.control_enabled {
+        return Err(ApiError::conflict(
+            "SHOCS control is disabled for this light; re-enable it from Manage",
+        ));
+    }
 
     let mode = if request.test {
         LightMode::Test
@@ -1121,36 +1289,43 @@ async fn set_mode(
         .map_err(ApiError::store)?
         .ok_or_else(|| ApiError::not_found("unknown light"))?;
 
-    // Changing modes starts with a clean mode-owned power state. Manual Test
-    // power overrides are intentionally per-enrollment and do not leak across
-    // a mode toggle.
-    let previous_override = state
-        .controller
-        .set_power_override(id, None)
-        .await
-        .flatten();
+    // An offline light can still change durable mode. Physical synchronization
+    // is simply deferred until discovery gives us a current network endpoint.
+    if let Some(light) = state.controller.light(id).await {
+        let previous_override = state
+            .controller
+            .set_power_override(id, None)
+            .await
+            .flatten();
 
-    if mode == LightMode::Test {
-        if let Err(err) = start_test_mode_sync(&state, id, &light).await {
-            if let Err(store_err) = state.controller.set_mode(id, previous).await {
-                error!(
-                    lifx_id = %format!("{id:#018x}"),
-                    error = %store_err,
-                    "failed to roll back persisted light mode after Test Mode sync failure"
-                );
+        if mode == LightMode::Test {
+            if let Err(err) = start_test_mode_sync(&state, id, &light).await {
+                if let Err(store_err) = state.controller.set_mode(id, previous).await {
+                    error!(
+                        lifx_id = %format!("{id:#018x}"),
+                        error = %store_err,
+                        "failed to roll back persisted light mode after Test Mode sync failure"
+                    );
+                }
+                let _ = state
+                    .controller
+                    .set_power_override(id, previous_override)
+                    .await;
+                return Err(ApiError::lifx(err));
             }
-            let _ = state
-                .controller
-                .set_power_override(id, previous_override)
-                .await;
-            return Err(ApiError::lifx(err));
         }
     }
+
+    // Keep awaits out of tracing macro arguments. Axum requires handler
+    // futures to be Send, and tracing's macro temporaries can otherwise be held
+    // across the await and make this handler future non-Send.
+    let online = state.controller.light(id).await.is_some();
 
     info!(
         lifx_id = %format!("{id:#018x}"),
         previous_mode = previous.as_str(),
         mode = mode.as_str(),
+        online,
         "web light mode changed"
     );
 
@@ -1345,6 +1520,26 @@ fn to_light_view(light: ManagedLight, online_window: Duration) -> LightView {
         hue_degrees: hue.map(u16_to_hue_degrees),
         saturation_percent: saturation.map(u16_to_percent),
         kelvin,
+    }
+}
+
+fn to_offline_light_view(light: StoredLight) -> LightView {
+    LightView {
+        id: format!("{:#018x}", light.id),
+        label: light
+            .friendly_name
+            .or(light.device_label)
+            .unwrap_or_else(|| format!("LIFX {:#018x}", light.id)),
+        address: "Not currently discovered".to_string(),
+        online: false,
+        control_enabled: light.control_enabled,
+        mode: light.mode.as_str(),
+        power_on: None,
+        brightness_percent: None,
+        brightness_transition: None,
+        hue_degrees: None,
+        saturation_percent: None,
+        kelvin: None,
     }
 }
 

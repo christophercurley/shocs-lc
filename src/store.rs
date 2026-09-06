@@ -310,6 +310,41 @@ impl PostgresStore {
         require_one_row(id, result.rows_affected())
     }
 
+    /// Persist one mode across every current member of a SHOCS light group.
+    ///
+    /// This is a configuration operation, so offline members are updated too.
+    /// Physical synchronization is deliberately handled by the controller/web
+    /// layer after the transaction commits.
+    pub async fn set_group_light_mode(
+        &self,
+        group_id: i64,
+        mode: LightMode,
+    ) -> Result<Vec<LifxId>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            UPDATE lights
+            SET mode = $2, updated_at = now()
+            WHERE lifx_id IN (
+                SELECT lifx_id
+                FROM light_group_members
+                WHERE group_id = $1
+            )
+            RETURNING lifx_id
+            "#,
+        )
+        .bind(group_id)
+        .bind(mode.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let lifx_id: String = row.try_get("lifx_id")?;
+                parse_lifx_id(&lifx_id)
+            })
+            .collect()
+    }
+
     pub async fn set_friendly_name(
         &self,
         id: LifxId,

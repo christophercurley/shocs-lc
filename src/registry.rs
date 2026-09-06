@@ -271,6 +271,10 @@ impl ControllerState {
             .collect()
     }
 
+    pub async fn configured_light(&self, id: LifxId) -> Option<StoredLight> {
+        self.persisted_lights.read().await.get(&id).cloned()
+    }
+
     pub async fn groups(&self) -> Vec<LightGroup> {
         self.groups.read().await.values().cloned().collect()
     }
@@ -349,7 +353,16 @@ impl ControllerState {
         id: LifxId,
         mode: LightMode,
     ) -> Result<Option<LightMode>, StoreError> {
-        let previous = self.lights.read().await.get(&id).map(|light| light.mode);
+        // Mode is durable configuration, not runtime reachability. Resolve the
+        // previous value from persisted inventory so an offline light can still
+        // be enrolled in (or removed from) a mode.
+        let previous = self
+            .persisted_lights
+            .read()
+            .await
+            .get(&id)
+            .map(|light| light.mode);
+
         let Some(previous) = previous else {
             return Ok(None);
         };
@@ -362,14 +375,51 @@ impl ControllerState {
         // operation fails cleanly and in-memory configuration remains unchanged.
         self.store.set_light_mode(id, mode).await?;
 
-        if let Some(light) = self.lights.write().await.get_mut(&id) {
-            light.mode = mode;
-        }
         if let Some(light) = self.persisted_lights.write().await.get_mut(&id) {
             light.mode = mode;
         }
+        if let Some(light) = self.lights.write().await.get_mut(&id) {
+            light.mode = mode;
+            light.power_override = None;
+        }
 
         Ok(Some(previous))
+    }
+
+    /// Register every member of a group into one mode as a single durable
+    /// configuration operation. Offline members are intentionally included.
+    pub async fn set_group_mode(
+        &self,
+        id: i64,
+        mode: LightMode,
+    ) -> Result<Vec<LifxId>, StoreError> {
+        if self.groups.read().await.get(&id).is_none() {
+            return Err(StoreError::UnknownGroup(id));
+        }
+
+        let updated_ids = self.store.set_group_light_mode(id, mode).await?;
+
+        {
+            let mut persisted = self.persisted_lights.write().await;
+            for light_id in &updated_ids {
+                if let Some(light) = persisted.get_mut(light_id) {
+                    light.mode = mode;
+                }
+            }
+        }
+
+        {
+            let mut runtime = self.lights.write().await;
+            for light_id in &updated_ids {
+                if let Some(light) = runtime.get_mut(light_id) {
+                    light.mode = mode;
+                    // Power overrides belong to a particular mode enrollment.
+                    light.power_override = None;
+                }
+            }
+        }
+
+        Ok(updated_ids)
     }
 
     pub async fn set_friendly_name(

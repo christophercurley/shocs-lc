@@ -271,6 +271,24 @@ function createGroupCard(group) {
   powerActions.append(offButton, onButton);
   powerRow.append(powerActions);
 
+  const modeRow = document.createElement("div");
+  modeRow.className = "group-control-row";
+  const modeCopy = document.createElement("div");
+  modeCopy.className = "control-copy";
+  modeCopy.innerHTML = `
+    <span class="control-label">Mode</span>
+    <span class="control-help">Applies to every member, including offline lights.</span>
+  `;
+  const modeActions = document.createElement("div");
+  modeActions.className = "group-power-actions";
+  const customModeButton = makeButton("Custom");
+  const testModeButton = makeButton("Test");
+  const modeState = document.createElement("span");
+  modeState.className = "mode-chip";
+  modeState.textContent = group.mode_state ?? "none";
+  modeActions.append(customModeButton, testModeButton, modeState);
+  modeRow.append(modeCopy, modeActions);
+
   const brightnessRow = document.createElement("div");
   brightnessRow.className = "group-brightness-row";
   const brightnessHeader = document.createElement("div");
@@ -321,10 +339,13 @@ function createGroupCard(group) {
   readout.append(hueReadout, satReadout);
   colorPanel.append(wheel, readout);
 
-  const controlsDisabled = group.control_enabled_count === 0;
+  const controlsDisabled = group.online_control_enabled_count === 0;
+  const modeDisabled = group.member_count === 0;
   for (const control of [offButton, onButton, slider, colorButton]) {
     control.disabled = controlsDisabled;
   }
+  customModeButton.disabled = modeDisabled;
+  testModeButton.disabled = modeDisabled;
 
   let currentHue = group.hue_degrees ?? 0;
   let currentSaturation = group.saturation_percent ?? 0;
@@ -434,6 +455,36 @@ function createGroupCard(group) {
     }
   });
 
+  async function applyGroupMode(test) {
+    customModeButton.disabled = true;
+    testModeButton.disabled = true;
+
+    try {
+      const response = await api(`/api/groups/${group.id}/mode`, {
+        method: "PUT",
+        body: JSON.stringify({ test }),
+      });
+      const result = await response.json();
+
+      const pending = result.pending_sync > 0
+        ? ` · ${result.pending_sync} pending/offline`
+        : "";
+
+      showToast(
+        `${group.name}: ${test ? "Test" : "Custom"} mode applied to ${result.members} member${result.members === 1 ? "" : "s"}${pending}`,
+      );
+      await refreshGroups();
+    } catch (error) {
+      showToast(error.message, true);
+    } finally {
+      customModeButton.disabled = modeDisabled;
+      testModeButton.disabled = modeDisabled;
+    }
+  }
+
+  customModeButton.addEventListener("click", () => applyGroupMode(false));
+  testModeButton.addEventListener("click", () => applyGroupMode(true));
+
   saveName.addEventListener("click", async () => {
     saveName.disabled = true;
     try {
@@ -483,7 +534,7 @@ function createGroupCard(group) {
     }
   });
 
-  controls.append(controlsTitle, powerRow, brightnessRow, colorRow, colorPanel);
+  controls.append(controlsTitle, powerRow, modeRow, brightnessRow, colorRow, colorPanel);
   card.append(header, nameRow, members, controls);
   return card;
 }
