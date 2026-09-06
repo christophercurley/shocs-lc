@@ -1,2 +1,2 @@
 [alias]
-verify = "run --quiet --manifest-path tools/xtask/Cargo.toml -- verify"
+verify = "run --quiet --target-dir target --manifest-path tools/xtask/Cargo.toml -- verify"
