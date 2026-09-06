@@ -20,7 +20,7 @@ use schedule::desired_power_now;
 use store::PostgresStore;
 use tasks::{
     apply_test_power, color_task, discovery_task, poll_light_states, power_schedule_task,
-    state_poll_task, test_reconcile_task,
+    state_poll_task, test_reconcile_task, timer_mode_task,
 };
 use test_mode::TestModeState;
 use web::WebState;
@@ -63,9 +63,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let store = Arc::new(PostgresStore::connect(&config.database_url).await?);
     let persisted_lights = store.load_lights().await?;
     let persisted_groups = store.load_groups().await?;
+    let persisted_timers = store.load_timer_schedules().await?;
     info!(
         lights = persisted_lights.len(),
         groups = persisted_groups.len(),
+        timers = persisted_timers.len(),
         "PostgreSQL configuration loaded and migrations are current"
     );
 
@@ -76,6 +78,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &config.initial_test_ids,
         persisted_lights,
         persisted_groups,
+        persisted_timers,
         Arc::clone(&store),
     );
 
@@ -126,6 +129,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         test_mode.clone(),
     ));
 
+    let timer_handle = tokio::spawn(timer_mode_task(
+        Arc::clone(&client),
+        state.clone(),
+        Arc::clone(&config),
+    ));
+
     let listener = TcpListener::bind(config.http_bind_addr).await?;
     let app = web::router(WebState {
         client: Arc::clone(&client),
@@ -156,6 +165,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     reconcile_handle.abort();
     color_handle.abort();
     power_handle.abort();
+    timer_handle.abort();
     web_handle.abort();
 
     Ok(())

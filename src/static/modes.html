@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Modes · SHOCS</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/modes.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand-link" href="/" aria-label="SHOCS home">
+        <span class="brand-mark brand-mark-small" aria-hidden="true">S</span>
+        <span>SHOCS</span>
+      </a>
+      <nav class="topnav" aria-label="Light Controller">
+        <a class="topnav-link" href="/lights">Controls</a>
+        <a class="topnav-link" href="/manage">Manage</a>
+        <a class="topnav-link" href="/groups">Groups</a>
+        <a class="topnav-link is-active" href="/modes">Modes</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="shell lights-shell">
+    <section class="page-heading">
+      <div>
+        <p class="eyebrow">LIGHT CONTROLLER</p>
+        <h1>Modes</h1>
+        <p>Automation ownership and persisted schedules.</p>
+      </div>
+      <div class="refresh-status" id="modes-status" aria-live="polite">Connecting…</div>
+    </section>
+
+    <section class="mode-overview-grid">
+      <article class="mode-overview-card">
+        <div class="mode-card-heading">
+          <div>
+            <p class="eyebrow">BUILT IN</p>
+            <h2>Test Mode</h2>
+          </div>
+          <span class="mode-chip">test</span>
+        </div>
+        <p>Shared color heartbeat plus the existing fixed power window.</p>
+        <dl class="mode-facts" id="test-mode-facts">
+          <div><dt>Power ON</dt><dd>—</dd></div>
+          <div><dt>Power OFF</dt><dd>—</dd></div>
+          <div><dt>Heartbeat</dt><dd>—</dd></div>
+          <div><dt>Transition</dt><dd>—</dd></div>
+        </dl>
+      </article>
+
+      <article class="mode-overview-card">
+        <div class="mode-card-heading">
+          <div>
+            <p class="eyebrow">PH3-B</p>
+            <h2>Timer Mode</h2>
+          </div>
+          <span class="mode-chip">timer</span>
+        </div>
+        <p>
+          Timer Mode owns power only. Manual power is a temporary override until
+          the next timer boundary; manual brightness or color moves that light to Custom.
+        </p>
+        <p class="mode-timezone" id="timer-timezone">Timezone: —</p>
+      </article>
+    </section>
+
+    <section class="group-create-card timer-create-card" aria-labelledby="create-timer-title">
+      <div>
+        <h2 id="create-timer-title">Create Timer schedule</h2>
+        <p>Saving an enabled schedule registers every target light into Timer Mode.</p>
+      </div>
+      <form id="create-timer-form" class="timer-form">
+        <label class="timer-field">
+          <span>Target type</span>
+          <select id="new-timer-target-type" class="text-input">
+            <option value="group">Group</option>
+            <option value="light">Light</option>
+          </select>
+        </label>
+        <label class="timer-field timer-target-field">
+          <span>Target</span>
+          <select id="new-timer-target" class="text-input" required></select>
+        </label>
+        <label class="timer-field">
+          <span>ON</span>
+          <input id="new-timer-on" class="text-input" type="time" value="18:30" required>
+        </label>
+        <label class="timer-field">
+          <span>OFF</span>
+          <input id="new-timer-off" class="text-input" type="time" value="01:00" required>
+        </label>
+        <label class="timer-enabled-field">
+          <input id="new-timer-enabled" type="checkbox" checked>
+          <span>Enabled</span>
+        </label>
+        <button class="save-button" type="submit">Create Timer</button>
+      </form>
+    </section>
+
+    <section class="timer-grid" id="timer-grid" aria-live="polite">
+      <div class="empty-card">Loading Timer schedules…</div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

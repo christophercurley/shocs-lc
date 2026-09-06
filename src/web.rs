@@ -6,13 +6,14 @@ use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
+use chrono::NaiveTime;
 use lifx::{Color, LifxClient, LifxId, Power};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use tracing::{error, info, trace, warn};
 
 use crate::config::Config;
-use crate::registry::{ControllerState, LightMode, ManagedLight};
+use crate::registry::{ControllerState, LightMode, ManagedLight, TimerSchedule, TimerTarget};
 use crate::store::{StoreError, StoredLight};
 use crate::tasks::{confirm_test_mode_sync, sync_light_to_test_mode};
 use crate::test_mode::TestModeState;
@@ -35,10 +36,12 @@ pub fn router(state: WebState) -> Router {
         .route("/lights", get(lights_page))
         .route("/manage", get(manage_page))
         .route("/groups", get(groups_page))
+        .route("/modes", get(modes_page))
         .route("/static/styles.css", get(stylesheet))
         .route("/static/app.js", get(app_javascript))
         .route("/static/manage.js", get(manage_javascript))
         .route("/static/groups.js", get(groups_javascript))
+        .route("/static/modes.js", get(modes_javascript))
         .route("/api/lights", get(list_lights))
         .route("/api/manage/lights", get(list_managed_lights))
         .route("/api/manage/lights/{id}", put(update_managed_light))
@@ -48,6 +51,15 @@ pub fn router(state: WebState) -> Router {
         .route("/api/groups/{id}/brightness", put(set_group_brightness))
         .route("/api/groups/{id}/color", put(set_group_color))
         .route("/api/groups/{id}/mode", put(set_group_mode))
+        .route("/api/modes", get(list_modes))
+        .route(
+            "/api/modes/timers",
+            axum::routing::post(create_timer_schedule),
+        )
+        .route(
+            "/api/modes/timers/{id}",
+            put(update_timer_schedule).delete(delete_timer_schedule),
+        )
         .route("/api/lights/{id}/power", put(set_power))
         .route("/api/lights/{id}/brightness", put(set_brightness))
         .route("/api/lights/{id}/color", put(set_color))
@@ -69,6 +81,10 @@ async fn manage_page() -> Html<&'static str> {
 
 async fn groups_page() -> Html<&'static str> {
     Html(include_str!("static/groups.html"))
+}
+
+async fn modes_page() -> Html<&'static str> {
+    Html(include_str!("static/modes.html"))
 }
 
 async fn stylesheet() -> impl IntoResponse {
@@ -96,6 +112,13 @@ async fn groups_javascript() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("static/groups.js"),
+    )
+}
+
+async fn modes_javascript() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("static/modes.js"),
     )
 }
 
@@ -370,6 +393,7 @@ struct GroupView {
     mode_state: Option<&'static str>,
     power_state: Option<&'static str>,
     brightness_percent: Option<u8>,
+    brightness_transition: Option<BrightnessTransitionView>,
     hue_degrees: Option<u16>,
     saturation_percent: Option<u8>,
     kelvin: Option<u16>,
@@ -519,6 +543,35 @@ async fn list_groups(State(state): State<WebState>) -> Json<GroupsView> {
                 Some(u16_to_percent(average.min(u32::from(u16::MAX)) as u16))
             };
 
+            // Mirror the individual-light API's transition metadata so the
+            // group slider can animate to a mode-owned brightness target instead
+            // of freezing at the transition's starting value.
+            let active_transitions = controllable
+                .iter()
+                .filter_map(|light| light.brightness_transition.as_ref())
+                .filter(|transition| transition.is_active(now))
+                .collect::<Vec<_>>();
+
+            let brightness_transition = if active_transitions.is_empty() {
+                None
+            } else {
+                let average_target = active_transitions
+                    .iter()
+                    .map(|transition| u32::from(transition.to))
+                    .sum::<u32>()
+                    / active_transitions.len() as u32;
+                let remaining = active_transitions
+                    .iter()
+                    .map(|transition| transition.remaining(now))
+                    .max()
+                    .unwrap_or_default();
+
+                Some(BrightnessTransitionView {
+                    to_percent: u16_to_percent(average_target.min(u32::from(u16::MAX)) as u16),
+                    remaining_ms: remaining.as_millis().min(u128::from(u64::MAX)) as u64,
+                })
+            };
+
             let color_source = controllable.first().copied();
             let hue = color_source.and_then(|light| {
                 light
@@ -554,6 +607,7 @@ async fn list_groups(State(state): State<WebState>) -> Json<GroupsView> {
                 mode_state,
                 power_state,
                 brightness_percent,
+                brightness_transition,
                 hue_degrees: hue.map(u16_to_hue_degrees),
                 saturation_percent: saturation.map(u16_to_percent),
                 kelvin,
@@ -600,9 +654,11 @@ async fn update_group(
         ));
     }
 
-    if state.controller.group(id).await.is_none() {
-        return Err(ApiError::not_found("unknown light group"));
-    }
+    let previous_group = state
+        .controller
+        .group(id)
+        .await
+        .ok_or_else(|| ApiError::not_found("unknown light group"))?;
 
     if let Some(name) = request.name {
         let name = normalize_group_name(name)?;
@@ -622,15 +678,50 @@ async fn update_group(
         parsed.sort_unstable();
         parsed.dedup();
 
+        let timer = state
+            .controller
+            .timer_for_target(TimerTarget::Group(id))
+            .await
+            .filter(|schedule| schedule.enabled);
+
+        if let Some(schedule) = &timer {
+            ensure_timer_members_overlap_free(&state, &parsed, Some(schedule.id)).await?;
+        }
+
         state
             .controller
             .set_group_members(id, parsed.clone())
             .await
             .map_err(ApiError::store)?;
 
+        if timer.is_some() {
+            let current = parsed
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            let removed = previous_group
+                .member_ids
+                .iter()
+                .copied()
+                .filter(|member_id| !current.contains(member_id))
+                .collect::<Vec<_>>();
+
+            state
+                .controller
+                .set_mode_for_ids(&removed, LightMode::Custom)
+                .await
+                .map_err(ApiError::store)?;
+            state
+                .controller
+                .set_mode_for_ids(&parsed, LightMode::Timer)
+                .await
+                .map_err(ApiError::store)?;
+        }
+
         info!(
             group_id = id,
             members = parsed.len(),
+            timer_mode = timer.is_some(),
             "light group membership updated"
         );
     }
@@ -642,11 +733,30 @@ async fn delete_group(
     State(state): State<WebState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
+    let group = state
+        .controller
+        .group(id)
+        .await
+        .ok_or_else(|| ApiError::not_found("unknown light group"))?;
+    let had_enabled_timer = state
+        .controller
+        .timer_for_target(TimerTarget::Group(id))
+        .await
+        .is_some_and(|schedule| schedule.enabled);
+
     state
         .controller
         .delete_group(id)
         .await
         .map_err(ApiError::store)?;
+
+    if had_enabled_timer {
+        state
+            .controller
+            .set_mode_for_ids(&group.member_ids, LightMode::Custom)
+            .await
+            .map_err(ApiError::store)?;
+    }
 
     info!(group_id = id, "light group deleted");
     Ok(StatusCode::NO_CONTENT)
@@ -695,7 +805,7 @@ async fn set_group_power(
         .map_err(ApiError::lifx)?;
 
     for light in &lights {
-        if light.mode == LightMode::Test {
+        if light.mode.supports_power_override() {
             let _ = state
                 .controller
                 .set_power_override(light.device.id, Some(power))
@@ -736,7 +846,7 @@ async fn set_group_brightness(
             .await
             .map_err(ApiError::store)?;
 
-        if previous_mode == Some(LightMode::Test) {
+        if previous_mode.is_some_and(|mode| mode.supports_power_override()) {
             let _ = state
                 .controller
                 .set_power_override(light.device.id, None)
@@ -818,7 +928,7 @@ async fn set_group_color(
             .await
             .map_err(ApiError::store)?;
 
-        if previous_mode == Some(LightMode::Test) {
+        if previous_mode.is_some_and(|mode| mode.supports_power_override()) {
             let _ = state
                 .controller
                 .set_power_override(light.device.id, None)
@@ -979,6 +1089,496 @@ async fn set_group_mode(
     }))
 }
 
+#[derive(Debug, Serialize)]
+struct ModesView {
+    timezone: String,
+    test_mode: TestModeView,
+    targets: Vec<TimerTargetView>,
+    timers: Vec<TimerScheduleView>,
+}
+
+#[derive(Debug, Serialize)]
+struct TestModeView {
+    on_time: String,
+    off_time: String,
+    color_interval_seconds: u64,
+    transition_seconds: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TimerTargetView {
+    target_type: &'static str,
+    target_id: String,
+    display_name: String,
+    member_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TimerScheduleView {
+    id: i64,
+    target_type: &'static str,
+    target_id: String,
+    target_name: String,
+    on_time: String,
+    off_time: String,
+    timezone: String,
+    enabled: bool,
+    member_count: usize,
+    online_count: usize,
+    mode_state: Option<&'static str>,
+    scheduled_power: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct TimerScheduleRequest {
+    target_type: String,
+    target_id: String,
+    on_time: String,
+    off_time: String,
+    enabled: bool,
+}
+
+async fn list_modes(State(state): State<WebState>) -> Result<Json<ModesView>, ApiError> {
+    let configured = state.controller.configured_lights().await;
+    let mut targets = configured
+        .iter()
+        .map(|light| TimerTargetView {
+            target_type: "light",
+            target_id: format!("{:016x}", light.id),
+            display_name: light
+                .friendly_name
+                .clone()
+                .or_else(|| light.device_label.clone())
+                .unwrap_or_else(|| format!("LIFX {:016x}", light.id)),
+            member_count: 1,
+        })
+        .collect::<Vec<_>>();
+
+    let mut groups = state.controller.groups().await;
+    groups.sort_by_key(|group| group.name.to_ascii_lowercase());
+    targets.extend(groups.iter().map(|group| TimerTargetView {
+        target_type: "group",
+        target_id: group.id.to_string(),
+        display_name: group.name.clone(),
+        member_count: group.member_ids.len(),
+    }));
+    targets.sort_by_key(|target| target.display_name.to_ascii_lowercase());
+
+    let online_window = state.config.state_poll_interval.saturating_mul(3);
+    let runtime = state
+        .controller
+        .lights()
+        .await
+        .into_iter()
+        .map(|light| (light.device.id, light))
+        .collect::<std::collections::HashMap<_, _>>();
+    let configured_by_id = configured
+        .into_iter()
+        .map(|light| (light.id, light))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut timers = state.controller.timer_schedules().await;
+    timers.sort_by_key(|schedule| schedule.id);
+    let mut timer_views = Vec::with_capacity(timers.len());
+
+    for schedule in timers {
+        let member_ids = state
+            .controller
+            .timer_target_member_ids(schedule.target)
+            .await;
+        let configured_members = member_ids
+            .iter()
+            .filter_map(|id| configured_by_id.get(id))
+            .collect::<Vec<_>>();
+        let mut modes = configured_members.iter().map(|light| light.mode);
+        let first_mode = modes.next();
+        let mode_state = match first_mode {
+            Some(first) if modes.all(|mode| mode == first) => Some(first.as_str()),
+            Some(_) => Some("mixed"),
+            None => None,
+        };
+        let online_count = member_ids
+            .iter()
+            .filter_map(|id| runtime.get(id))
+            .filter(|light| {
+                light
+                    .last_observed
+                    .is_some_and(|seen| seen.elapsed() <= online_window)
+            })
+            .count();
+        let (target_type, target_id, target_name) =
+            timer_target_identity(&state, schedule.target).await;
+        let scheduled_power = crate::schedule::desired_power_now(
+            schedule.timezone,
+            schedule.off_time,
+            schedule.on_time,
+        );
+
+        timer_views.push(TimerScheduleView {
+            id: schedule.id,
+            target_type,
+            target_id,
+            target_name,
+            on_time: schedule.on_time.format("%H:%M").to_string(),
+            off_time: schedule.off_time.format("%H:%M").to_string(),
+            timezone: schedule.timezone.to_string(),
+            enabled: schedule.enabled,
+            member_count: member_ids.len(),
+            online_count,
+            mode_state,
+            scheduled_power: match scheduled_power {
+                Power::On => "on",
+                Power::Off => "off",
+            },
+        });
+    }
+
+    Ok(Json(ModesView {
+        timezone: state.config.timezone.to_string(),
+        test_mode: TestModeView {
+            on_time: state.config.on_time.format("%H:%M").to_string(),
+            off_time: state.config.off_time.format("%H:%M").to_string(),
+            color_interval_seconds: state.config.color_interval.as_secs(),
+            transition_seconds: state.config.transition.as_secs(),
+        },
+        targets,
+        timers: timer_views,
+    }))
+}
+
+async fn create_timer_schedule(
+    State(state): State<WebState>,
+    Json(request): Json<TimerScheduleRequest>,
+) -> Result<(StatusCode, Json<TimerScheduleView>), ApiError> {
+    let target = parse_timer_target(&state, &request.target_type, &request.target_id).await?;
+    let on_time = parse_timer_time("on time", &request.on_time)?;
+    let off_time = parse_timer_time("off time", &request.off_time)?;
+    validate_timer_times(on_time, off_time)?;
+    let member_ids = require_timer_target_members(&state, target).await?;
+
+    if request.enabled {
+        ensure_timer_overlap_free(&state, target, None).await?;
+    }
+
+    let schedule = state
+        .controller
+        .create_timer_schedule(
+            target,
+            on_time,
+            off_time,
+            state.config.timezone,
+            request.enabled,
+        )
+        .await
+        .map_err(ApiError::store)?;
+
+    if request.enabled {
+        if let Err(err) = state
+            .controller
+            .set_mode_for_ids(&member_ids, LightMode::Timer)
+            .await
+        {
+            let _ = state.controller.delete_timer_schedule(schedule.id).await;
+            return Err(ApiError::store(err));
+        }
+    }
+
+    info!(
+        timer_id = schedule.id,
+        target = %format_timer_target(schedule.target),
+        on_time = %schedule.on_time.format("%H:%M"),
+        off_time = %schedule.off_time.format("%H:%M"),
+        enabled = schedule.enabled,
+        "Timer Mode schedule created"
+    );
+
+    let view = timer_schedule_view(&state, schedule).await?;
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+async fn update_timer_schedule(
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+    Json(request): Json<TimerScheduleRequest>,
+) -> Result<Json<TimerScheduleView>, ApiError> {
+    let previous = state
+        .controller
+        .timer_schedule(id)
+        .await
+        .ok_or_else(|| ApiError::not_found("unknown timer schedule"))?;
+    let target = parse_timer_target(&state, &request.target_type, &request.target_id).await?;
+    let on_time = parse_timer_time("on time", &request.on_time)?;
+    let off_time = parse_timer_time("off time", &request.off_time)?;
+    validate_timer_times(on_time, off_time)?;
+    let new_members = require_timer_target_members(&state, target).await?;
+
+    if request.enabled {
+        ensure_timer_overlap_free(&state, target, Some(id)).await?;
+    }
+
+    let old_members = state
+        .controller
+        .timer_target_member_ids(previous.target)
+        .await;
+
+    let schedule = state
+        .controller
+        .update_timer_schedule(
+            id,
+            target,
+            on_time,
+            off_time,
+            state.config.timezone,
+            request.enabled,
+        )
+        .await
+        .map_err(ApiError::store)?;
+
+    if previous.enabled {
+        state
+            .controller
+            .set_mode_for_ids(&old_members, LightMode::Custom)
+            .await
+            .map_err(ApiError::store)?;
+    }
+    if request.enabled {
+        state
+            .controller
+            .set_mode_for_ids(&new_members, LightMode::Timer)
+            .await
+            .map_err(ApiError::store)?;
+    }
+
+    info!(
+        timer_id = id,
+        target = %format_timer_target(schedule.target),
+        on_time = %schedule.on_time.format("%H:%M"),
+        off_time = %schedule.off_time.format("%H:%M"),
+        enabled = schedule.enabled,
+        "Timer Mode schedule updated"
+    );
+
+    Ok(Json(timer_schedule_view(&state, schedule).await?))
+}
+
+async fn delete_timer_schedule(
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let schedule = state
+        .controller
+        .timer_schedule(id)
+        .await
+        .ok_or_else(|| ApiError::not_found("unknown timer schedule"))?;
+    let members = state
+        .controller
+        .timer_target_member_ids(schedule.target)
+        .await;
+
+    state
+        .controller
+        .delete_timer_schedule(id)
+        .await
+        .map_err(ApiError::store)?;
+
+    if schedule.enabled {
+        state
+            .controller
+            .set_mode_for_ids(&members, LightMode::Custom)
+            .await
+            .map_err(ApiError::store)?;
+    }
+
+    info!(timer_id = id, "Timer Mode schedule deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn timer_schedule_view(
+    state: &WebState,
+    schedule: TimerSchedule,
+) -> Result<TimerScheduleView, ApiError> {
+    let member_ids = state
+        .controller
+        .timer_target_member_ids(schedule.target)
+        .await;
+    let configured = state.controller.configured_lights().await;
+    let configured_by_id = configured
+        .into_iter()
+        .map(|light| (light.id, light))
+        .collect::<std::collections::HashMap<_, _>>();
+    let configured_members = member_ids
+        .iter()
+        .filter_map(|id| configured_by_id.get(id))
+        .collect::<Vec<_>>();
+    let mut modes = configured_members.iter().map(|light| light.mode);
+    let first_mode = modes.next();
+    let mode_state = match first_mode {
+        Some(first) if modes.all(|mode| mode == first) => Some(first.as_str()),
+        Some(_) => Some("mixed"),
+        None => None,
+    };
+    let online_window = state.config.state_poll_interval.saturating_mul(3);
+    let runtime = state
+        .controller
+        .lights()
+        .await
+        .into_iter()
+        .map(|light| (light.device.id, light))
+        .collect::<std::collections::HashMap<_, _>>();
+    let online_count = member_ids
+        .iter()
+        .filter_map(|id| runtime.get(id))
+        .filter(|light| {
+            light
+                .last_observed
+                .is_some_and(|seen| seen.elapsed() <= online_window)
+        })
+        .count();
+    let (target_type, target_id, target_name) = timer_target_identity(state, schedule.target).await;
+    let scheduled_power =
+        crate::schedule::desired_power_now(schedule.timezone, schedule.off_time, schedule.on_time);
+
+    Ok(TimerScheduleView {
+        id: schedule.id,
+        target_type,
+        target_id,
+        target_name,
+        on_time: schedule.on_time.format("%H:%M").to_string(),
+        off_time: schedule.off_time.format("%H:%M").to_string(),
+        timezone: schedule.timezone.to_string(),
+        enabled: schedule.enabled,
+        member_count: member_ids.len(),
+        online_count,
+        mode_state,
+        scheduled_power: match scheduled_power {
+            Power::On => "on",
+            Power::Off => "off",
+        },
+    })
+}
+
+async fn timer_target_identity(
+    state: &WebState,
+    target: TimerTarget,
+) -> (&'static str, String, String) {
+    match target {
+        TimerTarget::Light(id) => {
+            let name = state
+                .controller
+                .configured_light(id)
+                .await
+                .and_then(|light| light.friendly_name.or(light.device_label))
+                .unwrap_or_else(|| format!("LIFX {id:016x}"));
+            ("light", format!("{id:016x}"), name)
+        }
+        TimerTarget::Group(id) => {
+            let name = state
+                .controller
+                .group(id)
+                .await
+                .map(|group| group.name)
+                .unwrap_or_else(|| format!("Group {id}"));
+            ("group", id.to_string(), name)
+        }
+    }
+}
+
+async fn parse_timer_target(
+    state: &WebState,
+    target_type: &str,
+    target_id: &str,
+) -> Result<TimerTarget, ApiError> {
+    match target_type {
+        "light" => {
+            let id = parse_lifx_id(target_id)?;
+            if state.controller.configured_light(id).await.is_none() {
+                return Err(ApiError::not_found("unknown timer light target"));
+            }
+            Ok(TimerTarget::Light(id))
+        }
+        "group" => {
+            let id = target_id
+                .parse::<i64>()
+                .map_err(|_| ApiError::bad_request("invalid timer group target"))?;
+            if state.controller.group(id).await.is_none() {
+                return Err(ApiError::not_found("unknown timer group target"));
+            }
+            Ok(TimerTarget::Group(id))
+        }
+        _ => Err(ApiError::bad_request(
+            "timer target type must be 'light' or 'group'",
+        )),
+    }
+}
+
+async fn require_timer_target_members(
+    state: &WebState,
+    target: TimerTarget,
+) -> Result<Vec<LifxId>, ApiError> {
+    let ids = state.controller.timer_target_member_ids(target).await;
+    if ids.is_empty() {
+        return Err(ApiError::conflict("timer target has no lights"));
+    }
+    Ok(ids)
+}
+
+async fn ensure_timer_overlap_free(
+    state: &WebState,
+    target: TimerTarget,
+    exclude_id: Option<i64>,
+) -> Result<(), ApiError> {
+    let member_ids = state.controller.timer_target_member_ids(target).await;
+    ensure_timer_members_overlap_free(state, &member_ids, exclude_id).await
+}
+
+async fn ensure_timer_members_overlap_free(
+    state: &WebState,
+    member_ids: &[LifxId],
+    exclude_id: Option<i64>,
+) -> Result<(), ApiError> {
+    let candidate = member_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+
+    for schedule in state.controller.timer_schedules().await {
+        if !schedule.enabled || Some(schedule.id) == exclude_id {
+            continue;
+        }
+        let other = state
+            .controller
+            .timer_target_member_ids(schedule.target)
+            .await;
+        if let Some(overlap) = other.into_iter().find(|id| candidate.contains(id)) {
+            return Err(ApiError::conflict(format!(
+                "Timer target overlaps enabled timer {} on light {overlap:016x}",
+                schedule.id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_timer_time(label: &str, value: &str) -> Result<NaiveTime, ApiError> {
+    NaiveTime::parse_from_str(value, "%H:%M")
+        .map_err(|_| ApiError::bad_request(format!("invalid {label}; expected HH:MM")))
+}
+
+fn validate_timer_times(on_time: NaiveTime, off_time: NaiveTime) -> Result<(), ApiError> {
+    if on_time == off_time {
+        return Err(ApiError::bad_request("Timer ON and OFF times must differ"));
+    }
+    Ok(())
+}
+
+fn format_timer_target(target: TimerTarget) -> String {
+    match target {
+        TimerTarget::Light(id) => format!("light:{id:016x}"),
+        TimerTarget::Group(id) => format!("group:{id}"),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PowerRequest {
     on: bool,
@@ -1000,11 +1600,11 @@ async fn set_power(
 
     let power = if request.on { Power::On } else { Power::Off };
 
-    // Power is intentionally orthogonal to mode. While a light is in Test
+    // Power is intentionally orthogonal to automation mode. In Test or Timer
     // Mode, a manual power command becomes a temporary per-light override
-    // instead of ejecting the light from the mode. The next Test power
+    // instead of ejecting the light from the mode. The next owning power
     // schedule boundary clears the override and resumes scheduled power.
-    let previous_override = if light.mode == LightMode::Test {
+    let previous_override = if light.mode.supports_power_override() {
         state
             .controller
             .set_power_override(id, Some(power))
@@ -1029,7 +1629,7 @@ async fn set_power(
             .set_desired_power(id, previous_desired)
             .await;
 
-        if light.mode == LightMode::Test {
+        if light.mode.supports_power_override() {
             let _ = state
                 .controller
                 .set_power_override(id, previous_override)
@@ -1044,7 +1644,7 @@ async fn set_power(
         lifx_id = %format!("{id:#018x}"),
         power = ?power,
         mode = light.mode.as_str(),
-        power_override = light.mode == LightMode::Test,
+        power_override = light.mode.supports_power_override(),
         "manual web power command"
     );
 
@@ -1082,12 +1682,12 @@ async fn set_brightness(
         .await
         .map_err(ApiError::store)?;
 
-    if previous_mode == Some(LightMode::Test) {
+    if previous_mode.is_some_and(|mode| mode.supports_power_override()) {
         let _ = state.controller.set_power_override(id, None).await;
 
         info!(
             lifx_id = %format!("{id:#018x}"),
-            "manual live control moved light from Test to Custom mode"
+            "manual live control moved light from automation to Custom mode"
         );
     }
 
@@ -1185,12 +1785,12 @@ async fn set_color(
         .await
         .map_err(ApiError::store)?;
 
-    if previous_mode == Some(LightMode::Test) {
+    if previous_mode.is_some_and(|mode| mode.supports_power_override()) {
         let _ = state.controller.set_power_override(id, None).await;
 
         info!(
             lifx_id = %format!("{id:#018x}"),
-            "manual color control moved light from Test to Custom mode"
+            "manual color control moved light from automation to Custom mode"
         );
     }
 
@@ -1623,6 +2223,13 @@ impl ApiError {
                 "group name is invalid; trim whitespace and use 64 UTF-8 bytes or fewer",
             ),
             StoreError::UnknownGroup(_) => Self::not_found("unknown light group"),
+            StoreError::UnknownTimerSchedule(_) => Self::not_found("unknown timer schedule"),
+            StoreError::TimerTargetConflict(_) => {
+                Self::conflict("that target already has a Timer schedule")
+            }
+            StoreError::InvalidTimerTarget(_) | StoreError::InvalidTimerTimezone(_) => {
+                Self::bad_request("invalid Timer schedule configuration")
+            }
             other => {
                 error!(error = %other, "persistent light configuration update failed");
                 Self {

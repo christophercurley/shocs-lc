@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt;
 
+use chrono::NaiveTime;
+use chrono_tz::Tz;
 use lifx::LifxId;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
@@ -26,6 +28,22 @@ pub struct StoredGroup {
     pub member_ids: Vec<LifxId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredTimerTarget {
+    Light(LifxId),
+    Group(i64),
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredTimerSchedule {
+    pub id: i64,
+    pub target: StoredTimerTarget,
+    pub on_time: NaiveTime,
+    pub off_time: NaiveTime,
+    pub timezone: Tz,
+    pub enabled: bool,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Sqlx(sqlx::Error),
@@ -38,6 +56,10 @@ pub enum StoreError {
     UnknownGroup(i64),
     GroupNameConflict(String),
     InvalidGroupName(String),
+    UnknownTimerSchedule(i64),
+    TimerTargetConflict(String),
+    InvalidTimerTarget(String),
+    InvalidTimerTimezone(String),
 }
 
 impl fmt::Display for StoreError {
@@ -61,6 +83,12 @@ impl fmt::Display for StoreError {
             Self::InvalidGroupName(name) => {
                 write!(f, "group name '{name}' violates database constraints")
             }
+            Self::UnknownTimerSchedule(id) => write!(f, "unknown timer schedule {id}"),
+            Self::TimerTargetConflict(target) => {
+                write!(f, "timer target '{target}' already has a schedule")
+            }
+            Self::InvalidTimerTarget(target) => write!(f, "invalid timer target '{target}'"),
+            Self::InvalidTimerTimezone(value) => write!(f, "invalid timer timezone '{value}'"),
         }
     }
 }
@@ -77,7 +105,11 @@ impl Error for StoreError {
             | Self::InvalidFriendlyName(_)
             | Self::UnknownGroup(_)
             | Self::GroupNameConflict(_)
-            | Self::InvalidGroupName(_) => None,
+            | Self::InvalidGroupName(_)
+            | Self::UnknownTimerSchedule(_)
+            | Self::TimerTargetConflict(_)
+            | Self::InvalidTimerTarget(_)
+            | Self::InvalidTimerTimezone(_) => None,
         }
     }
 }
@@ -168,6 +200,28 @@ impl PostgresStore {
         }
 
         Ok(groups)
+    }
+
+    pub async fn load_timer_schedules(&self) -> Result<Vec<StoredTimerSchedule>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id,
+                target_type,
+                light_id,
+                group_id,
+                to_char(on_time, 'HH24:MI') AS on_time,
+                to_char(off_time, 'HH24:MI') AS off_time,
+                timezone,
+                enabled
+            FROM timer_schedules
+            ORDER BY id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(decode_timer_schedule).collect()
     }
 
     pub async fn create_group(&self, name: &str) -> Result<StoredGroup, StoreError> {
@@ -345,6 +399,113 @@ impl PostgresStore {
             .collect()
     }
 
+    pub async fn create_timer_schedule(
+        &self,
+        target: StoredTimerTarget,
+        on_time: NaiveTime,
+        off_time: NaiveTime,
+        timezone: Tz,
+        enabled: bool,
+    ) -> Result<StoredTimerSchedule, StoreError> {
+        let (target_type, light_id, group_id, target_key) = timer_target_parts(target);
+        let row = sqlx::query(
+            r#"
+            INSERT INTO timer_schedules (
+                target_type, light_id, group_id, on_time, off_time, timezone, enabled
+            )
+            VALUES (
+                $1, $2, $3, CAST($4 AS time), CAST($5 AS time), $6, $7
+            )
+            RETURNING
+                id,
+                target_type,
+                light_id,
+                group_id,
+                to_char(on_time, 'HH24:MI') AS on_time,
+                to_char(off_time, 'HH24:MI') AS off_time,
+                timezone,
+                enabled
+            "#,
+        )
+        .bind(target_type)
+        .bind(light_id)
+        .bind(group_id)
+        .bind(on_time.format("%H:%M").to_string())
+        .bind(off_time.format("%H:%M").to_string())
+        .bind(timezone.to_string())
+        .bind(enabled)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| map_timer_error(err, &target_key))?;
+
+        decode_timer_schedule(row)
+    }
+
+    pub async fn update_timer_schedule(
+        &self,
+        id: i64,
+        target: StoredTimerTarget,
+        on_time: NaiveTime,
+        off_time: NaiveTime,
+        timezone: Tz,
+        enabled: bool,
+    ) -> Result<StoredTimerSchedule, StoreError> {
+        let (target_type, light_id, group_id, target_key) = timer_target_parts(target);
+        let row = sqlx::query(
+            r#"
+            UPDATE timer_schedules
+            SET target_type = $2,
+                light_id = $3,
+                group_id = $4,
+                on_time = CAST($5 AS time),
+                off_time = CAST($6 AS time),
+                timezone = $7,
+                enabled = $8,
+                updated_at = now()
+            WHERE id = $1
+            RETURNING
+                id,
+                target_type,
+                light_id,
+                group_id,
+                to_char(on_time, 'HH24:MI') AS on_time,
+                to_char(off_time, 'HH24:MI') AS off_time,
+                timezone,
+                enabled
+            "#,
+        )
+        .bind(id)
+        .bind(target_type)
+        .bind(light_id)
+        .bind(group_id)
+        .bind(on_time.format("%H:%M").to_string())
+        .bind(off_time.format("%H:%M").to_string())
+        .bind(timezone.to_string())
+        .bind(enabled)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| map_timer_error(err, &target_key))?;
+
+        let Some(row) = row else {
+            return Err(StoreError::UnknownTimerSchedule(id));
+        };
+
+        decode_timer_schedule(row)
+    }
+
+    pub async fn delete_timer_schedule(&self, id: i64) -> Result<(), StoreError> {
+        let result = sqlx::query("DELETE FROM timer_schedules WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() != 1 {
+            return Err(StoreError::UnknownTimerSchedule(id));
+        }
+
+        Ok(())
+    }
+
     pub async fn set_friendly_name(
         &self,
         id: LifxId,
@@ -405,6 +566,34 @@ impl PostgresStore {
 
         require_one_row(id, result.rows_affected())
     }
+}
+
+fn timer_target_parts(
+    target: StoredTimerTarget,
+) -> (&'static str, Option<String>, Option<i64>, String) {
+    match target {
+        StoredTimerTarget::Light(id) => (
+            "light",
+            Some(format_lifx_id(id)),
+            None,
+            format!("light:{id:016x}"),
+        ),
+        StoredTimerTarget::Group(id) => ("group", None, Some(id), format!("group:{id}")),
+    }
+}
+
+fn map_timer_error(err: sqlx::Error, target: &str) -> StoreError {
+    if let sqlx::Error::Database(database_error) = &err {
+        match database_error.code().as_deref() {
+            Some("23505") => return StoreError::TimerTargetConflict(target.to_string()),
+            Some("23514") | Some("23503") => {
+                return StoreError::InvalidTimerTarget(target.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    StoreError::Sqlx(err)
 }
 
 fn map_friendly_name_error(err: sqlx::Error, friendly_name: Option<&str>) -> StoreError {
@@ -470,6 +659,46 @@ fn decode_light(row: sqlx::postgres::PgRow) -> Result<StoredLight, StoreError> {
         friendly_name: row.try_get("friendly_name")?,
         control_enabled: row.try_get("control_enabled")?,
         mode,
+    })
+}
+
+fn decode_timer_schedule(row: sqlx::postgres::PgRow) -> Result<StoredTimerSchedule, StoreError> {
+    let target_type: String = row.try_get("target_type")?;
+    let target = match target_type.as_str() {
+        "light" => {
+            let value: String = row
+                .try_get::<Option<String>, _>("light_id")?
+                .ok_or_else(|| StoreError::InvalidTimerTarget("light:<null>".to_string()))?;
+            StoredTimerTarget::Light(parse_lifx_id(&value)?)
+        }
+        "group" => {
+            let id = row
+                .try_get::<Option<i64>, _>("group_id")?
+                .ok_or_else(|| StoreError::InvalidTimerTarget("group:<null>".to_string()))?;
+            StoredTimerTarget::Group(id)
+        }
+        other => return Err(StoreError::InvalidTimerTarget(other.to_string())),
+    };
+
+    let on_time: String = row.try_get("on_time")?;
+    let off_time: String = row.try_get("off_time")?;
+    let timezone_name: String = row.try_get("timezone")?;
+
+    let on_time = NaiveTime::parse_from_str(&on_time, "%H:%M")
+        .map_err(|_| StoreError::InvalidTimerTarget(format!("on_time:{on_time}")))?;
+    let off_time = NaiveTime::parse_from_str(&off_time, "%H:%M")
+        .map_err(|_| StoreError::InvalidTimerTarget(format!("off_time:{off_time}")))?;
+    let timezone = timezone_name
+        .parse::<Tz>()
+        .map_err(|_| StoreError::InvalidTimerTimezone(timezone_name.clone()))?;
+
+    Ok(StoredTimerSchedule {
+        id: row.try_get("id")?,
+        target,
+        on_time,
+        off_time,
+        timezone,
+        enabled: row.try_get("enabled")?,
     })
 }
 

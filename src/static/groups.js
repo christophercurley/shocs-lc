@@ -127,6 +127,31 @@ function setBrightnessVisual(slider, percent) {
   slider.style.setProperty("--brightness-fill", `${clamped}%`);
 }
 
+function animateGroupBrightness(slider, valueLabel, from, to, durationMs) {
+  const start = performance.now();
+  const startValue = Number(from);
+  const targetValue = Number(to);
+  const duration = Math.max(0, Number(durationMs));
+
+  if (duration === 0 || startValue === targetValue) {
+    slider.value = String(Math.round(targetValue));
+    valueLabel.textContent = `${Math.round(targetValue)}%`;
+    setBrightnessVisual(slider, targetValue);
+    return;
+  }
+
+  function frame(now) {
+    const progress = Math.min(1, (now - start) / duration);
+    const value = startValue + (targetValue - startValue) * progress;
+    slider.value = String(Math.round(value));
+    valueLabel.textContent = `${Math.round(value)}%`;
+    setBrightnessVisual(slider, value);
+    if (progress < 1) requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+}
+
 function kelvinToCss(kelvin) {
   const temperature = Math.max(1000, Math.min(40000, Number(kelvin || 3500))) / 100;
   let red;
@@ -309,6 +334,16 @@ function createGroupCard(group) {
   slider.value = String(initialBrightness);
   setBrightnessVisual(slider, initialBrightness);
   brightnessRow.append(brightnessHeader, slider);
+
+  if (group.brightness_transition?.remaining_ms > 0) {
+    animateGroupBrightness(
+      slider,
+      brightnessValue,
+      initialBrightness,
+      group.brightness_transition.to_percent,
+      group.brightness_transition.remaining_ms,
+    );
+  }
 
   const colorRow = document.createElement("div");
   colorRow.className = "group-color-row";

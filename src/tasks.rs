@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
-use crate::registry::{ControllerState, LightMode, refresh_registry};
+use crate::registry::{ControllerState, LightMode, TimerSchedule, TimerTarget, refresh_registry};
 use crate::schedule::{desired_power_now, next_power_boundary};
 use crate::test_mode::TestModeState;
 
@@ -401,5 +402,131 @@ pub async fn power_schedule_task(
         // behavior remain authoritative rather than assuming a fixed cadence.
         let current = desired_power_now(config.timezone, config.off_time, config.on_time);
         test_mode.set_power(current);
+    }
+}
+
+/// Run persisted Timer Mode schedules entirely from in-memory configuration.
+///
+/// PostgreSQL is read only at startup/configuration changes; this loop does not
+/// poll the database. A manual power override on a Timer light is honored until
+/// that timer's next ON/OFF boundary, mirroring Test Mode's power semantics.
+pub async fn timer_mode_task(client: Arc<LifxClient>, state: ControllerState, config: Arc<Config>) {
+    let mut applied = HashMap::<i64, String>::new();
+
+    loop {
+        let mut schedules = state.timer_schedules().await;
+        schedules.sort_by_key(|schedule| schedule.id);
+
+        let active_ids = schedules
+            .iter()
+            .filter(|schedule| schedule.enabled)
+            .map(|schedule| schedule.id)
+            .collect::<HashSet<_>>();
+        applied.retain(|id, _| active_ids.contains(id));
+
+        // Lowest timer ID wins defensively if a later group-membership edit
+        // somehow creates overlap that bypassed API validation.
+        let mut claimed = HashSet::new();
+
+        for schedule in schedules.into_iter().filter(|schedule| schedule.enabled) {
+            let desired = desired_power_now(schedule.timezone, schedule.off_time, schedule.on_time);
+            let fingerprint = timer_fingerprint(&schedule, desired);
+            let boundary_or_config_changed = applied.get(&schedule.id) != Some(&fingerprint);
+
+            let lights = state.timer_target_lights(schedule.target).await;
+            let mut on_devices = Vec::new();
+            let mut off_devices = Vec::new();
+
+            for light in lights {
+                if light.mode != LightMode::Timer || !light.control_enabled {
+                    continue;
+                }
+                if !claimed.insert(light.device.id) {
+                    continue;
+                }
+
+                if boundary_or_config_changed {
+                    let _ = state.set_power_override(light.device.id, None).await;
+                }
+
+                let refreshed = state.light(light.device.id).await.unwrap_or(light.clone());
+                let effective = refreshed.power_override.unwrap_or(desired);
+                let mismatch = refreshed.desired_power != Some(effective)
+                    || refreshed
+                        .observed
+                        .map_or(true, |observed| observed.power != effective);
+
+                if !boundary_or_config_changed && !mismatch {
+                    continue;
+                }
+
+                let _ = state
+                    .set_desired_power(refreshed.device.id, Some(effective))
+                    .await;
+
+                match effective {
+                    Power::On => on_devices.push(refreshed.device),
+                    Power::Off => off_devices.push(refreshed.device),
+                }
+            }
+
+            for (power, devices) in [(Power::Off, off_devices), (Power::On, on_devices)] {
+                if devices.is_empty() {
+                    continue;
+                }
+
+                match client
+                    .set_power_many(&devices, power, config.transition)
+                    .await
+                {
+                    Ok(()) => info!(
+                        timer_id = schedule.id,
+                        lights = devices.len(),
+                        power = ?power,
+                        transition_seconds = config.transition.as_secs(),
+                        "applied Timer Mode power"
+                    ),
+                    Err(err) => warn!(
+                        timer_id = schedule.id,
+                        power = ?power,
+                        error = %err,
+                        "Timer Mode power update failed"
+                    ),
+                }
+            }
+
+            if boundary_or_config_changed {
+                info!(
+                    timer_id = schedule.id,
+                    target = %timer_target_log(schedule.target),
+                    on_time = %schedule.on_time.format("%H:%M"),
+                    off_time = %schedule.off_time.format("%H:%M"),
+                    timezone = %schedule.timezone,
+                    power = ?desired,
+                    "Timer Mode schedule became authoritative"
+                );
+                applied.insert(schedule.id, fingerprint);
+            }
+        }
+
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn timer_fingerprint(schedule: &TimerSchedule, desired: Power) -> String {
+    format!(
+        "{}|{}|{}|{}|{:?}",
+        timer_target_log(schedule.target),
+        schedule.on_time.format("%H:%M"),
+        schedule.off_time.format("%H:%M"),
+        schedule.timezone,
+        desired
+    )
+}
+
+fn timer_target_log(target: TimerTarget) -> String {
+    match target {
+        TimerTarget::Light(id) => format!("light:{id:016x}"),
+        TimerTarget::Group(id) => format!("group:{id}"),
     }
 }

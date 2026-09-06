@@ -526,6 +526,10 @@ function createCard(light) {
     </div>
   `;
 
+  const currentModeChip = document.createElement("span");
+  currentModeChip.className = "mode-chip";
+  currentModeChip.textContent = light.mode;
+
   const testSwitch = createSwitch(light.mode === "test", "Test Mode", async (input) => {
     const desired = input.checked;
     refs.modePending = true;
@@ -547,7 +551,10 @@ function createCard(light) {
       await refreshLights();
     }
   });
-  testRow.append(testSwitch.wrapper);
+  const modeActions = document.createElement("div");
+  modeActions.className = "group-power-actions";
+  modeActions.append(testSwitch.wrapper, currentModeChip);
+  testRow.append(modeActions);
 
   controls.append(powerRow, brightnessRow, colorRow, colorPanel, testRow);
   card.append(header, controls);
@@ -580,6 +587,7 @@ function createCard(light) {
     colorInteracting: false,
     lastColorMutationAt: 0,
     testInput: testSwitch.input,
+    modeChip: currentModeChip,
     modePending: false,
     lastModeMutationAt: 0,
   };
@@ -663,6 +671,7 @@ function updateCard(light, refreshStartedAt) {
   }
 
   refs.testInput.disabled = !light.control_enabled || refs.modePending;
+  refs.modeChip.textContent = light.mode;
 
   if (
     !refs.modePending &&

@@ -3,15 +3,20 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::NaiveTime;
+use chrono_tz::Tz;
 use lifx::{Color, LifxClient, LifxDevice, LifxId, LightState, Power};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::store::{PostgresStore, StoreError, StoredGroup, StoredLight};
+use crate::store::{
+    PostgresStore, StoreError, StoredGroup, StoredLight, StoredTimerSchedule, StoredTimerTarget,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightMode {
     Test,
+    Timer,
     Custom,
 }
 
@@ -19,6 +24,7 @@ impl LightMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Test => "test",
+            Self::Timer => "timer",
             Self::Custom => "custom",
         }
     }
@@ -26,9 +32,14 @@ impl LightMode {
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "test" => Some(Self::Test),
+            "timer" => Some(Self::Timer),
             "custom" => Some(Self::Custom),
             _ => None,
         }
+    }
+
+    pub const fn supports_power_override(self) -> bool {
+        matches!(self, Self::Test | Self::Timer)
     }
 }
 
@@ -170,6 +181,53 @@ impl From<StoredGroup> for LightGroup {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimerTarget {
+    Light(LifxId),
+    Group(i64),
+}
+
+impl From<StoredTimerTarget> for TimerTarget {
+    fn from(target: StoredTimerTarget) -> Self {
+        match target {
+            StoredTimerTarget::Light(id) => Self::Light(id),
+            StoredTimerTarget::Group(id) => Self::Group(id),
+        }
+    }
+}
+
+impl From<TimerTarget> for StoredTimerTarget {
+    fn from(target: TimerTarget) -> Self {
+        match target {
+            TimerTarget::Light(id) => Self::Light(id),
+            TimerTarget::Group(id) => Self::Group(id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimerSchedule {
+    pub id: i64,
+    pub target: TimerTarget,
+    pub on_time: NaiveTime,
+    pub off_time: NaiveTime,
+    pub timezone: Tz,
+    pub enabled: bool,
+}
+
+impl From<StoredTimerSchedule> for TimerSchedule {
+    fn from(schedule: StoredTimerSchedule) -> Self {
+        Self {
+            id: schedule.id,
+            target: schedule.target.into(),
+            on_time: schedule.on_time,
+            off_time: schedule.off_time,
+            timezone: schedule.timezone,
+            enabled: schedule.enabled,
+        }
+    }
+}
+
 /// Shared in-memory controller state.
 ///
 /// Web/API code talks to this abstraction instead of reaching into the
@@ -180,6 +238,7 @@ pub struct ControllerState {
     lights: Arc<RwLock<HashMap<LifxId, ManagedLight>>>,
     persisted_lights: Arc<RwLock<HashMap<LifxId, StoredLight>>>,
     groups: Arc<RwLock<HashMap<i64, LightGroup>>>,
+    timers: Arc<RwLock<HashMap<i64, TimerSchedule>>>,
     initial_test_ids: Arc<HashSet<LifxId>>,
     store: Arc<PostgresStore>,
 }
@@ -189,6 +248,7 @@ impl ControllerState {
         initial_test_ids: &[LifxId],
         persisted_lights: Vec<StoredLight>,
         persisted_groups: Vec<StoredGroup>,
+        persisted_timers: Vec<StoredTimerSchedule>,
         store: Arc<PostgresStore>,
     ) -> Self {
         let persisted_lights = persisted_lights
@@ -204,10 +264,19 @@ impl ControllerState {
             })
             .collect();
 
+        let timers = persisted_timers
+            .into_iter()
+            .map(|schedule| {
+                let schedule = TimerSchedule::from(schedule);
+                (schedule.id, schedule)
+            })
+            .collect();
+
         Self {
             lights: Arc::new(RwLock::new(HashMap::new())),
             persisted_lights: Arc::new(RwLock::new(persisted_lights)),
             groups: Arc::new(RwLock::new(groups)),
+            timers: Arc::new(RwLock::new(timers)),
             initial_test_ids: Arc::new(initial_test_ids.iter().copied().collect()),
             store,
         }
@@ -283,6 +352,105 @@ impl ControllerState {
         self.groups.read().await.get(&id).cloned()
     }
 
+    pub async fn timer_schedules(&self) -> Vec<TimerSchedule> {
+        self.timers.read().await.values().cloned().collect()
+    }
+
+    pub async fn timer_schedule(&self, id: i64) -> Option<TimerSchedule> {
+        self.timers.read().await.get(&id).cloned()
+    }
+
+    pub async fn timer_for_target(&self, target: TimerTarget) -> Option<TimerSchedule> {
+        self.timers
+            .read()
+            .await
+            .values()
+            .find(|schedule| schedule.target == target)
+            .cloned()
+    }
+
+    pub async fn create_timer_schedule(
+        &self,
+        target: TimerTarget,
+        on_time: NaiveTime,
+        off_time: NaiveTime,
+        timezone: Tz,
+        enabled: bool,
+    ) -> Result<TimerSchedule, StoreError> {
+        let stored = self
+            .store
+            .create_timer_schedule(target.into(), on_time, off_time, timezone, enabled)
+            .await?;
+        let schedule = TimerSchedule::from(stored);
+        self.timers
+            .write()
+            .await
+            .insert(schedule.id, schedule.clone());
+        Ok(schedule)
+    }
+
+    pub async fn update_timer_schedule(
+        &self,
+        id: i64,
+        target: TimerTarget,
+        on_time: NaiveTime,
+        off_time: NaiveTime,
+        timezone: Tz,
+        enabled: bool,
+    ) -> Result<TimerSchedule, StoreError> {
+        let stored = self
+            .store
+            .update_timer_schedule(id, target.into(), on_time, off_time, timezone, enabled)
+            .await?;
+        let schedule = TimerSchedule::from(stored);
+        self.timers.write().await.insert(id, schedule.clone());
+        Ok(schedule)
+    }
+
+    pub async fn delete_timer_schedule(&self, id: i64) -> Result<(), StoreError> {
+        self.store.delete_timer_schedule(id).await?;
+        self.timers.write().await.remove(&id);
+        Ok(())
+    }
+
+    pub async fn timer_target_member_ids(&self, target: TimerTarget) -> Vec<LifxId> {
+        match target {
+            TimerTarget::Light(id) => {
+                if self.persisted_lights.read().await.contains_key(&id) {
+                    vec![id]
+                } else {
+                    Vec::new()
+                }
+            }
+            TimerTarget::Group(id) => self
+                .groups
+                .read()
+                .await
+                .get(&id)
+                .map(|group| group.member_ids.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    pub async fn timer_target_lights(&self, target: TimerTarget) -> Vec<ManagedLight> {
+        let ids = self.timer_target_member_ids(target).await;
+        let lights = self.lights.read().await;
+        ids.into_iter()
+            .filter_map(|id| lights.get(&id).cloned())
+            .collect()
+    }
+
+    pub async fn set_mode_for_ids(
+        &self,
+        ids: &[LifxId],
+        mode: LightMode,
+    ) -> Result<(), StoreError> {
+        for id in ids {
+            let _ = self.set_mode(*id, mode).await?;
+        }
+        Ok(())
+    }
+
     pub async fn create_group(&self, name: String) -> Result<LightGroup, StoreError> {
         let stored = self.store.create_group(&name).await?;
         let group = LightGroup::from(stored);
@@ -302,6 +470,12 @@ impl ControllerState {
     pub async fn delete_group(&self, id: i64) -> Result<(), StoreError> {
         self.store.delete_group(id).await?;
         self.groups.write().await.remove(&id);
+        // PostgreSQL cascades group-target Timer schedules; mirror that cascade
+        // in memory so a deleted group cannot leave a ghost timer running.
+        self.timers
+            .write()
+            .await
+            .retain(|_, schedule| schedule.target != TimerTarget::Group(id));
         Ok(())
     }
 
