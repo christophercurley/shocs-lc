@@ -863,3 +863,224 @@ h1 {
     text-align: left;
   }
 }
+
+/* PH3-A2 group management + group control. */
+.group-create-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 22px;
+  margin-bottom: 22px;
+  padding: 20px 22px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--surface);
+}
+
+.group-create-card h2,
+.group-controls h3 {
+  margin: 0 0 5px;
+  font-size: 1rem;
+}
+
+.group-create-card p,
+.group-controls-heading p,
+.group-summary {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.group-create-form,
+.group-name-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.group-create-form {
+  width: min(420px, 100%);
+}
+
+.group-create-form .text-input,
+.group-name-row .text-input {
+  flex: 1;
+}
+
+.group-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.group-card {
+  min-width: 0;
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  background: var(--surface);
+  box-shadow: 0 8px 28px rgba(32, 44, 64, 0.045);
+}
+
+.group-card-header,
+.group-controls-heading,
+.group-control-row,
+.slider-label-row,
+.group-color-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.group-card-header {
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+
+.group-card-header h2 {
+  margin: 0 0 4px;
+  overflow-wrap: anywhere;
+  font-size: 1.2rem;
+}
+
+.group-delete-button,
+.group-action-button {
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.group-delete-button {
+  color: #a63d3d;
+}
+
+.group-delete-button:disabled,
+.group-action-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.group-name-row {
+  padding: 16px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.group-members {
+  padding: 16px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.group-members summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.group-member-list {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+}
+
+.group-member-option {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 46px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.group-member-option input {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+}
+
+.group-member-option span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.group-member-option strong {
+  overflow-wrap: anywhere;
+  font-size: 0.86rem;
+}
+
+.group-member-option small {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.group-members-save {
+  width: 100%;
+}
+
+.group-controls {
+  padding-top: 18px;
+}
+
+.group-controls-heading {
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+.group-control-row,
+.group-brightness-row,
+.group-color-row {
+  padding: 14px 0;
+  border-top: 1px solid var(--border);
+}
+
+.group-power-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.group-brightness-row .brightness-slider {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.group-color-row .control-help {
+  display: block;
+  margin-top: 4px;
+}
+
+@media (max-width: 760px) {
+  .group-create-card,
+  .group-create-form,
+  .group-name-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .group-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .group-card {
+    padding: 18px;
+  }
+
+  .group-create-form .save-button,
+  .group-name-row .save-button,
+  .group-members-save {
+    min-height: 48px;
+  }
+
+  .group-action-button,
+  .group-delete-button {
+    min-height: 44px;
+  }
+}

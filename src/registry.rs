@@ -7,7 +7,7 @@ use lifx::{Color, LifxClient, LifxDevice, LifxId, LightState, Power};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::store::{PostgresStore, StoreError, StoredLight};
+use crate::store::{PostgresStore, StoreError, StoredGroup, StoredLight};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightMode {
@@ -153,6 +153,23 @@ impl ManagedLight {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct LightGroup {
+    pub id: i64,
+    pub name: String,
+    pub member_ids: Vec<LifxId>,
+}
+
+impl From<StoredGroup> for LightGroup {
+    fn from(group: StoredGroup) -> Self {
+        Self {
+            id: group.id,
+            name: group.name,
+            member_ids: group.member_ids,
+        }
+    }
+}
+
 /// Shared in-memory controller state.
 ///
 /// Web/API code talks to this abstraction instead of reaching into the
@@ -162,6 +179,7 @@ impl ManagedLight {
 pub struct ControllerState {
     lights: Arc<RwLock<HashMap<LifxId, ManagedLight>>>,
     persisted_lights: Arc<RwLock<HashMap<LifxId, StoredLight>>>,
+    groups: Arc<RwLock<HashMap<i64, LightGroup>>>,
     initial_test_ids: Arc<HashSet<LifxId>>,
     store: Arc<PostgresStore>,
 }
@@ -170,6 +188,7 @@ impl ControllerState {
     pub fn new(
         initial_test_ids: &[LifxId],
         persisted_lights: Vec<StoredLight>,
+        persisted_groups: Vec<StoredGroup>,
         store: Arc<PostgresStore>,
     ) -> Self {
         let persisted_lights = persisted_lights
@@ -177,9 +196,18 @@ impl ControllerState {
             .map(|light| (light.id, light))
             .collect();
 
+        let groups = persisted_groups
+            .into_iter()
+            .map(|group| {
+                let group = LightGroup::from(group);
+                (group.id, group)
+            })
+            .collect();
+
         Self {
             lights: Arc::new(RwLock::new(HashMap::new())),
             persisted_lights: Arc::new(RwLock::new(persisted_lights)),
+            groups: Arc::new(RwLock::new(groups)),
             initial_test_ids: Arc::new(initial_test_ids.iter().copied().collect()),
             store,
         }
@@ -241,6 +269,75 @@ impl ControllerState {
             .values()
             .cloned()
             .collect()
+    }
+
+    pub async fn groups(&self) -> Vec<LightGroup> {
+        self.groups.read().await.values().cloned().collect()
+    }
+
+    pub async fn group(&self, id: i64) -> Option<LightGroup> {
+        self.groups.read().await.get(&id).cloned()
+    }
+
+    pub async fn create_group(&self, name: String) -> Result<LightGroup, StoreError> {
+        let stored = self.store.create_group(&name).await?;
+        let group = LightGroup::from(stored);
+        self.groups.write().await.insert(group.id, group.clone());
+        Ok(group)
+    }
+
+    pub async fn rename_group(&self, id: i64, name: String) -> Result<(), StoreError> {
+        self.store.rename_group(id, &name).await?;
+
+        let mut groups = self.groups.write().await;
+        let group = groups.get_mut(&id).ok_or(StoreError::UnknownGroup(id))?;
+        group.name = name;
+        Ok(())
+    }
+
+    pub async fn delete_group(&self, id: i64) -> Result<(), StoreError> {
+        self.store.delete_group(id).await?;
+        self.groups.write().await.remove(&id);
+        Ok(())
+    }
+
+    pub async fn set_group_members(
+        &self,
+        id: i64,
+        mut member_ids: Vec<LifxId>,
+    ) -> Result<(), StoreError> {
+        member_ids.sort_unstable();
+        member_ids.dedup();
+
+        {
+            let configured = self.persisted_lights.read().await;
+            if let Some(unknown) = member_ids.iter().find(|id| !configured.contains_key(id)) {
+                return Err(StoreError::UnknownLight(*unknown));
+            }
+        }
+
+        self.store.set_group_members(id, &member_ids).await?;
+
+        let mut groups = self.groups.write().await;
+        let group = groups.get_mut(&id).ok_or(StoreError::UnknownGroup(id))?;
+        group.member_ids = member_ids;
+        Ok(())
+    }
+
+    /// Resolve the runtime lights currently belonging to a group. Persisted
+    /// membership survives while bulbs are offline; only currently known runtime
+    /// devices are returned for immediate control.
+    pub async fn lights_in_group(&self, id: i64) -> Option<Vec<ManagedLight>> {
+        let group = self.groups.read().await.get(&id).cloned()?;
+        let lights = self.lights.read().await;
+
+        Some(
+            group
+                .member_ids
+                .iter()
+                .filter_map(|member_id| lights.get(member_id).cloned())
+                .collect(),
+        )
     }
 
     pub async fn light(&self, id: LifxId) -> Option<ManagedLight> {

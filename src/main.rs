@@ -62,10 +62,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let store = Arc::new(PostgresStore::connect(&config.database_url).await?);
     let persisted_lights = store.load_lights().await?;
-    let persisted_groups = store.group_count().await?;
+    let persisted_groups = store.load_groups().await?;
     info!(
         lights = persisted_lights.len(),
-        groups = persisted_groups,
+        groups = persisted_groups.len(),
         "PostgreSQL configuration loaded and migrations are current"
     );
 
@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = ControllerState::new(
         &config.initial_test_ids,
         persisted_lights,
+        persisted_groups,
         Arc::clone(&store),
     );
 

@@ -19,6 +19,13 @@ pub struct StoredLight {
     pub mode: LightMode,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredGroup {
+    pub id: i64,
+    pub name: String,
+    pub member_ids: Vec<LifxId>,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Sqlx(sqlx::Error),
@@ -28,6 +35,9 @@ pub enum StoreError {
     UnknownLight(LifxId),
     FriendlyNameConflict(String),
     InvalidFriendlyName(String),
+    UnknownGroup(i64),
+    GroupNameConflict(String),
+    InvalidGroupName(String),
 }
 
 impl fmt::Display for StoreError {
@@ -44,6 +54,13 @@ impl fmt::Display for StoreError {
             Self::InvalidFriendlyName(name) => {
                 write!(f, "friendly name '{name}' violates database constraints")
             }
+            Self::UnknownGroup(id) => write!(f, "unknown light group {id}"),
+            Self::GroupNameConflict(name) => {
+                write!(f, "group name '{name}' is already in use")
+            }
+            Self::InvalidGroupName(name) => {
+                write!(f, "group name '{name}' violates database constraints")
+            }
         }
     }
 }
@@ -57,7 +74,10 @@ impl Error for StoreError {
             | Self::InvalidMode(_)
             | Self::UnknownLight(_)
             | Self::FriendlyNameConflict(_)
-            | Self::InvalidFriendlyName(_) => None,
+            | Self::InvalidFriendlyName(_)
+            | Self::UnknownGroup(_)
+            | Self::GroupNameConflict(_)
+            | Self::InvalidGroupName(_) => None,
         }
     }
 }
@@ -112,12 +132,132 @@ impl PostgresStore {
         rows.into_iter().map(decode_light).collect()
     }
 
-    pub async fn group_count(&self) -> Result<i64, StoreError> {
-        let row = sqlx::query("SELECT count(*) AS count FROM light_groups")
-            .fetch_one(&self.pool)
+    pub async fn load_groups(&self) -> Result<Vec<StoredGroup>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT g.id, g.name, m.lifx_id
+            FROM light_groups g
+            LEFT JOIN light_group_members m ON m.group_id = g.id
+            ORDER BY lower(g.name), g.id, m.lifx_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut groups = Vec::<StoredGroup>::new();
+        let mut positions = std::collections::HashMap::<i64, usize>::new();
+
+        for row in rows {
+            let group_id: i64 = row.try_get("id")?;
+            let index = if let Some(index) = positions.get(&group_id).copied() {
+                index
+            } else {
+                let index = groups.len();
+                groups.push(StoredGroup {
+                    id: group_id,
+                    name: row.try_get("name")?,
+                    member_ids: Vec::new(),
+                });
+                positions.insert(group_id, index);
+                index
+            };
+
+            if let Some(lifx_id) = row.try_get::<Option<String>, _>("lifx_id")? {
+                groups[index].member_ids.push(parse_lifx_id(&lifx_id)?);
+            }
+        }
+
+        Ok(groups)
+    }
+
+    pub async fn create_group(&self, name: &str) -> Result<StoredGroup, StoreError> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO light_groups (name)
+            VALUES ($1)
+            RETURNING id, name
+            "#,
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| map_group_name_error(err, name))?;
+
+        Ok(StoredGroup {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            member_ids: Vec::new(),
+        })
+    }
+
+    pub async fn rename_group(&self, id: i64, name: &str) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE light_groups
+            SET name = $2, updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| map_group_name_error(err, name))?;
+
+        require_one_group(id, result.rows_affected())
+    }
+
+    pub async fn delete_group(&self, id: i64) -> Result<(), StoreError> {
+        let result = sqlx::query("DELETE FROM light_groups WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
             .await?;
 
-        Ok(row.try_get("count")?)
+        require_one_group(id, result.rows_affected())
+    }
+
+    pub async fn set_group_members(
+        &self,
+        id: i64,
+        member_ids: &[LifxId],
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM light_groups WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        if !exists {
+            return Err(StoreError::UnknownGroup(id));
+        }
+
+        sqlx::query("DELETE FROM light_group_members WHERE group_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        for member_id in member_ids {
+            sqlx::query(
+                r#"
+                INSERT INTO light_group_members (group_id, lifx_id)
+                VALUES ($1, $2)
+                "#,
+            )
+            .bind(id)
+            .bind(format_lifx_id(*member_id))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query("UPDATE light_groups SET updated_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Ensure a discovered physical light has durable configuration.
@@ -254,6 +394,26 @@ fn map_friendly_name_error(err: sqlx::Error, friendly_name: Option<&str>) -> Sto
     StoreError::Sqlx(err)
 }
 
+fn map_group_name_error(err: sqlx::Error, name: &str) -> StoreError {
+    if let sqlx::Error::Database(database_error) = &err {
+        match database_error.code().as_deref() {
+            Some("23505") => return StoreError::GroupNameConflict(name.to_string()),
+            Some("23514") => return StoreError::InvalidGroupName(name.to_string()),
+            _ => {}
+        }
+    }
+
+    StoreError::Sqlx(err)
+}
+
+fn require_one_group(id: i64, rows_affected: u64) -> Result<(), StoreError> {
+    if rows_affected != 1 {
+        return Err(StoreError::UnknownGroup(id));
+    }
+
+    Ok(())
+}
+
 fn require_one_row(id: LifxId, rows_affected: u64) -> Result<(), StoreError> {
     if rows_affected != 1 {
         return Err(StoreError::UnknownLight(id));
@@ -266,8 +426,7 @@ fn decode_light(row: sqlx::postgres::PgRow) -> Result<StoredLight, StoreError> {
     let lifx_id: String = row.try_get("lifx_id")?;
     let mode: String = row.try_get("mode")?;
 
-    let id = u64::from_str_radix(&lifx_id, 16)
-        .map_err(|_| StoreError::InvalidLifxId(lifx_id.clone()))?;
+    let id = parse_lifx_id(&lifx_id)?;
     let mode = LightMode::from_str(&mode).ok_or_else(|| StoreError::InvalidMode(mode.clone()))?;
 
     Ok(StoredLight {
@@ -277,6 +436,10 @@ fn decode_light(row: sqlx::postgres::PgRow) -> Result<StoredLight, StoreError> {
         control_enabled: row.try_get("control_enabled")?,
         mode,
     })
+}
+
+fn parse_lifx_id(value: &str) -> Result<LifxId, StoreError> {
+    u64::from_str_radix(value, 16).map_err(|_| StoreError::InvalidLifxId(value.to_string()))
 }
 
 fn format_lifx_id(id: LifxId) -> String {

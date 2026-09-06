@@ -34,12 +34,19 @@ pub fn router(state: WebState) -> Router {
         .route("/", get(index_page))
         .route("/lights", get(lights_page))
         .route("/manage", get(manage_page))
+        .route("/groups", get(groups_page))
         .route("/static/styles.css", get(stylesheet))
         .route("/static/app.js", get(app_javascript))
         .route("/static/manage.js", get(manage_javascript))
+        .route("/static/groups.js", get(groups_javascript))
         .route("/api/lights", get(list_lights))
         .route("/api/manage/lights", get(list_managed_lights))
         .route("/api/manage/lights/{id}", put(update_managed_light))
+        .route("/api/groups", get(list_groups).post(create_group))
+        .route("/api/groups/{id}", put(update_group).delete(delete_group))
+        .route("/api/groups/{id}/power", put(set_group_power))
+        .route("/api/groups/{id}/brightness", put(set_group_brightness))
+        .route("/api/groups/{id}/color", put(set_group_color))
         .route("/api/lights/{id}/power", put(set_power))
         .route("/api/lights/{id}/brightness", put(set_brightness))
         .route("/api/lights/{id}/color", put(set_color))
@@ -57,6 +64,10 @@ async fn lights_page() -> Html<&'static str> {
 
 async fn manage_page() -> Html<&'static str> {
     Html(include_str!("static/manage.html"))
+}
+
+async fn groups_page() -> Html<&'static str> {
+    Html(include_str!("static/groups.html"))
 }
 
 async fn stylesheet() -> impl IntoResponse {
@@ -77,6 +88,13 @@ async fn manage_javascript() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("static/manage.js"),
+    )
+}
+
+async fn groups_javascript() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("static/groups.js"),
     )
 }
 
@@ -303,6 +321,498 @@ async fn update_managed_light(
         label_synced,
         test_state_synced,
     }))
+}
+
+#[derive(Debug, Serialize)]
+struct GroupLightOption {
+    id: String,
+    display_name: String,
+    control_enabled: bool,
+    online: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct GroupView {
+    id: i64,
+    name: String,
+    member_ids: Vec<String>,
+    member_count: usize,
+    control_enabled_count: usize,
+    online_count: usize,
+    power_state: Option<&'static str>,
+    brightness_percent: Option<u8>,
+    hue_degrees: Option<u16>,
+    saturation_percent: Option<u8>,
+    kelvin: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+struct GroupsView {
+    groups: Vec<GroupView>,
+    lights: Vec<GroupLightOption>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateGroupRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateGroupRequest {
+    name: Option<String>,
+    member_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateGroupResult {
+    id: i64,
+    name: String,
+}
+
+async fn list_groups(State(state): State<WebState>) -> Json<GroupsView> {
+    let online_window = state.config.state_poll_interval.saturating_mul(3);
+    let runtime_lights = state.controller.lights().await;
+    let runtime = runtime_lights
+        .iter()
+        .cloned()
+        .map(|light| (light.device.id, light))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let configured = state.controller.configured_lights().await;
+    let mut light_options = configured
+        .iter()
+        .map(|light| {
+            let runtime_light = runtime.get(&light.id);
+            GroupLightOption {
+                id: format!("{:#018x}", light.id),
+                display_name: light
+                    .friendly_name
+                    .clone()
+                    .or_else(|| light.device_label.clone())
+                    .unwrap_or_else(|| format!("LIFX {:#018x}", light.id)),
+                control_enabled: light.control_enabled,
+                online: runtime_light
+                    .and_then(|light| light.last_observed)
+                    .is_some_and(|seen| seen.elapsed() <= online_window),
+            }
+        })
+        .collect::<Vec<_>>();
+    light_options.sort_by_key(|light| light.display_name.to_ascii_lowercase());
+
+    let mut groups = state.controller.groups().await;
+    groups.sort_by_key(|group| group.name.to_ascii_lowercase());
+
+    let views = groups
+        .into_iter()
+        .map(|group| {
+            let member_count = group.member_ids.len();
+            let members = group
+                .member_ids
+                .iter()
+                .filter_map(|id| runtime.get(id))
+                .collect::<Vec<_>>();
+
+            let controllable = members
+                .iter()
+                .copied()
+                .filter(|light| light.control_enabled)
+                .collect::<Vec<_>>();
+
+            let online_count = members
+                .iter()
+                .filter(|light| {
+                    light
+                        .last_observed
+                        .is_some_and(|seen| seen.elapsed() <= online_window)
+                })
+                .count();
+
+            let mut power_values = controllable.iter().filter_map(|light| {
+                light
+                    .desired_power
+                    .or_else(|| light.observed.map(|state| state.power))
+            });
+            let first_power = power_values.next();
+            let power_state = match first_power {
+                Some(first) if power_values.all(|power| power == first) => Some(match first {
+                    Power::On => "on",
+                    Power::Off => "off",
+                }),
+                Some(_) => Some("mixed"),
+                None => None,
+            };
+
+            let now = Instant::now();
+            let brightness_values = controllable
+                .iter()
+                .filter_map(|light| light.projected_brightness(now))
+                .map(u32::from)
+                .collect::<Vec<_>>();
+            let brightness_percent = if brightness_values.is_empty() {
+                None
+            } else {
+                let average =
+                    brightness_values.iter().copied().sum::<u32>() / brightness_values.len() as u32;
+                Some(u16_to_percent(average.min(u32::from(u16::MAX)) as u16))
+            };
+
+            let color_source = controllable.first().copied();
+            let hue = color_source.and_then(|light| {
+                light
+                    .desired_color
+                    .map(|color| color.hue)
+                    .or_else(|| light.observed.map(|state| state.hue))
+            });
+            let saturation = color_source.and_then(|light| {
+                light
+                    .desired_color
+                    .map(|color| color.saturation)
+                    .or_else(|| light.observed.map(|state| state.saturation))
+            });
+            let kelvin = color_source.and_then(|light| {
+                light
+                    .desired_color
+                    .map(|color| color.kelvin)
+                    .or_else(|| light.observed.map(|state| state.kelvin))
+            });
+
+            GroupView {
+                id: group.id,
+                name: group.name,
+                member_ids: group
+                    .member_ids
+                    .into_iter()
+                    .map(|id| format!("{id:#018x}"))
+                    .collect(),
+                member_count,
+                control_enabled_count: controllable.len(),
+                online_count,
+                power_state,
+                brightness_percent,
+                hue_degrees: hue.map(u16_to_hue_degrees),
+                saturation_percent: saturation.map(u16_to_percent),
+                kelvin,
+            }
+        })
+        .collect();
+
+    Json(GroupsView {
+        groups: views,
+        lights: light_options,
+    })
+}
+
+async fn create_group(
+    State(state): State<WebState>,
+    Json(request): Json<CreateGroupRequest>,
+) -> Result<(StatusCode, Json<CreateGroupResult>), ApiError> {
+    let name = normalize_group_name(request.name)?;
+    let group = state
+        .controller
+        .create_group(name)
+        .await
+        .map_err(ApiError::store)?;
+
+    info!(group_id = group.id, group_name = %group.name, "light group created");
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateGroupResult {
+            id: group.id,
+            name: group.name,
+        }),
+    ))
+}
+
+async fn update_group(
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+    Json(request): Json<UpdateGroupRequest>,
+) -> Result<StatusCode, ApiError> {
+    if request.name.is_none() && request.member_ids.is_none() {
+        return Err(ApiError::bad_request(
+            "no group-management fields were supplied",
+        ));
+    }
+
+    if state.controller.group(id).await.is_none() {
+        return Err(ApiError::not_found("unknown light group"));
+    }
+
+    if let Some(name) = request.name {
+        let name = normalize_group_name(name)?;
+        state
+            .controller
+            .rename_group(id, name.clone())
+            .await
+            .map_err(ApiError::store)?;
+        info!(group_id = id, group_name = %name, "light group renamed");
+    }
+
+    if let Some(member_ids) = request.member_ids {
+        let mut parsed = Vec::with_capacity(member_ids.len());
+        for member_id in member_ids {
+            parsed.push(parse_lifx_id(&member_id)?);
+        }
+        parsed.sort_unstable();
+        parsed.dedup();
+
+        state
+            .controller
+            .set_group_members(id, parsed.clone())
+            .await
+            .map_err(ApiError::store)?;
+
+        info!(
+            group_id = id,
+            members = parsed.len(),
+            "light group membership updated"
+        );
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_group(
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .controller
+        .delete_group(id)
+        .await
+        .map_err(ApiError::store)?;
+
+    info!(group_id = id, "light group deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn controlled_group_lights(
+    state: &WebState,
+    group_id: i64,
+) -> Result<Vec<ManagedLight>, ApiError> {
+    let lights = state
+        .controller
+        .lights_in_group(group_id)
+        .await
+        .ok_or_else(|| ApiError::not_found("unknown light group"))?;
+
+    let lights = lights
+        .into_iter()
+        .filter(|light| light.control_enabled)
+        .collect::<Vec<_>>();
+
+    if lights.is_empty() {
+        return Err(ApiError::conflict(
+            "group has no currently controllable lights",
+        ));
+    }
+
+    Ok(lights)
+}
+
+async fn set_group_power(
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+    Json(request): Json<PowerRequest>,
+) -> Result<StatusCode, ApiError> {
+    let lights = controlled_group_lights(&state, id).await?;
+    let power = if request.on { Power::On } else { Power::Off };
+    let devices = lights
+        .iter()
+        .map(|light| light.device.clone())
+        .collect::<Vec<_>>();
+
+    state
+        .client
+        .set_power_many(&devices, power, MANUAL_TRANSITION)
+        .await
+        .map_err(ApiError::lifx)?;
+
+    for light in &lights {
+        if light.mode == LightMode::Test {
+            let _ = state
+                .controller
+                .set_power_override(light.device.id, Some(power))
+                .await;
+        }
+        let _ = state
+            .controller
+            .set_desired_power(light.device.id, Some(power))
+            .await;
+    }
+
+    info!(
+        group_id = id,
+        lights = lights.len(),
+        power = ?power,
+        "manual group power command"
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_group_brightness(
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+    Json(request): Json<BrightnessRequest>,
+) -> Result<StatusCode, ApiError> {
+    if request.percent > 100 {
+        return Err(ApiError::bad_request("brightness percent must be 0-100"));
+    }
+
+    let lights = controlled_group_lights(&state, id).await?;
+    let brightness = percent_to_u16(request.percent);
+
+    for light in &lights {
+        let previous_mode = state
+            .controller
+            .set_mode(light.device.id, LightMode::Custom)
+            .await
+            .map_err(ApiError::store)?;
+
+        if previous_mode == Some(LightMode::Test) {
+            let _ = state
+                .controller
+                .set_power_override(light.device.id, None)
+                .await;
+        }
+
+        let observed = match light.observed {
+            Some(observed) => observed,
+            None => state
+                .client
+                .get_light_state(&light.device)
+                .await
+                .map_err(ApiError::lifx)?,
+        };
+
+        let desired_color = light.desired_color;
+        let color = Color::new(
+            desired_color.map(|color| color.hue).unwrap_or(observed.hue),
+            desired_color
+                .map(|color| color.saturation)
+                .unwrap_or(observed.saturation),
+            brightness,
+            desired_color
+                .map(|color| color.kelvin)
+                .unwrap_or(observed.kelvin),
+        );
+
+        state
+            .client
+            .set_color(&light.device, color, LIVE_CONTROL_TRANSITION)
+            .await
+            .map_err(ApiError::lifx)?;
+
+        state
+            .controller
+            .set_desired_brightness(light.device.id, brightness)
+            .await;
+    }
+
+    if request.final_update {
+        info!(
+            group_id = id,
+            lights = lights.len(),
+            brightness_percent = request.percent,
+            "manual group brightness command committed"
+        );
+    } else {
+        trace!(
+            group_id = id,
+            lights = lights.len(),
+            brightness_percent = request.percent,
+            "manual group brightness live update"
+        );
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_group_color(
+    State(state): State<WebState>,
+    Path(id): Path<i64>,
+    Json(request): Json<ColorRequest>,
+) -> Result<StatusCode, ApiError> {
+    if request.hue_degrees > 360 {
+        return Err(ApiError::bad_request("hue must be 0-360 degrees"));
+    }
+    if request.saturation_percent > 100 {
+        return Err(ApiError::bad_request("saturation percent must be 0-100"));
+    }
+
+    let lights = controlled_group_lights(&state, id).await?;
+    let hue = hue_degrees_to_u16(request.hue_degrees);
+    let saturation = percent_to_u16(request.saturation_percent);
+
+    for light in &lights {
+        let previous_mode = state
+            .controller
+            .set_mode(light.device.id, LightMode::Custom)
+            .await
+            .map_err(ApiError::store)?;
+
+        if previous_mode == Some(LightMode::Test) {
+            let _ = state
+                .controller
+                .set_power_override(light.device.id, None)
+                .await;
+        }
+
+        let observed = match light.observed {
+            Some(observed) => observed,
+            None => state
+                .client
+                .get_light_state(&light.device)
+                .await
+                .map_err(ApiError::lifx)?,
+        };
+
+        let brightness = light
+            .projected_brightness(Instant::now())
+            .unwrap_or(observed.brightness);
+        let kelvin = light
+            .desired_color
+            .map(|color| color.kelvin)
+            .unwrap_or(observed.kelvin);
+        let color = Color::new(hue, saturation, brightness, kelvin);
+
+        state
+            .client
+            .set_color(&light.device, color, LIVE_CONTROL_TRANSITION)
+            .await
+            .map_err(ApiError::lifx)?;
+
+        state
+            .controller
+            .set_desired_color(light.device.id, color)
+            .await;
+        state
+            .controller
+            .set_desired_brightness(light.device.id, brightness)
+            .await;
+    }
+
+    if request.final_update {
+        info!(
+            group_id = id,
+            lights = lights.len(),
+            hue_degrees = request.hue_degrees,
+            saturation_percent = request.saturation_percent,
+            "manual group color command committed"
+        );
+    } else {
+        trace!(
+            group_id = id,
+            lights = lights.len(),
+            hue_degrees = request.hue_degrees,
+            saturation_percent = request.saturation_percent,
+            "manual group color live update"
+        );
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -707,6 +1217,28 @@ fn require_control_enabled(light: &ManagedLight) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn normalize_group_name(value: String) -> Result<String, ApiError> {
+    let value = value.trim();
+
+    if value.is_empty() {
+        return Err(ApiError::bad_request("group name cannot be empty"));
+    }
+
+    if value.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "group name cannot contain control characters",
+        ));
+    }
+
+    if value.len() > 64 {
+        return Err(ApiError::bad_request(
+            "group name must be 64 UTF-8 bytes or fewer",
+        ));
+    }
+
+    Ok(value.to_string())
+}
+
 fn normalize_friendly_name(value: Option<String>) -> Result<Option<String>, ApiError> {
     let Some(value) = value else {
         return Ok(None);
@@ -889,6 +1421,13 @@ impl ApiError {
             StoreError::InvalidFriendlyName(_) => Self::bad_request(
                 "friendly name is invalid; trim whitespace and use 31 UTF-8 bytes or fewer",
             ),
+            StoreError::GroupNameConflict(name) => Self::conflict(format!(
+                "A group named '{name}' already exists. Group names must be unique."
+            )),
+            StoreError::InvalidGroupName(_) => Self::bad_request(
+                "group name is invalid; trim whitespace and use 64 UTF-8 bytes or fewer",
+            ),
+            StoreError::UnknownGroup(_) => Self::not_found("unknown light group"),
             other => {
                 error!(error = %other, "persistent light configuration update failed");
                 Self {
